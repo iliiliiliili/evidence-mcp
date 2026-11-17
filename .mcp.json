@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vscode/main/extensions/mcp/types/mcpConfig.schema.json",
+  "servers": {
+    "evidence-llm-evidence-workshop": {
+      "type": "stdio",
+      "command": "/home/io/code/llm-evidence-workshop/.venv/bin/evidence-mcp",
+      "args": ["--config", "/home/io/code/llm-evidence-workshop/.evidence/config.yaml"],
+      "env": {
+        "EVIDENCE_MCP_ALLOW_INGEST": "0"
+      }
+    }
+  }
+}

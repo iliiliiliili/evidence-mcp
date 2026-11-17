@@ -1,0 +1,116 @@
+# Evidence example configuration.
+#
+# Every value shown is the built-in default unless noted otherwise. Copy this
+# to `config.yaml` and override only what you need, then run:
+#
+#     evidence ingest ./corpus -c config.yaml
+#     evidence ask "..." -c config.yaml
+#
+# Environment overrides use the `EVIDENCE_<SECTION>_<FIELD>` convention, e.g.:
+#     EVIDENCE_OLLAMA_REASONING=qwen3.8:27b
+
+# ── Local models (Ollama) ────────────────────────────────────────────────
+ollama:
+  host: http://localhost:11434
+  reasoning: qwen3.5:9b      # Planner / Writer / Critic + sufficiency review
+  light: qwen3.5:4b          # classify / rewrite / lightweight reasoning
+  embed: bge-m3              # dense embedding model (FAISS)
+  reranker_local: BAAI/bge-reranker-v2-m3   # optional cross-encoder reranker
+  request_timeout: 180
+
+# ── Hybrid retrieval ─────────────────────────────────────────────────────
+retrieval:
+  candidates: 50             # FAISS + BM25 candidates before RRF fusion
+  rrf_k: 60                  # reciprocal-rank-fusion smoothing constant
+  keep_after_rerank: 15      # chunks kept after reranking
+  use_bm25: true
+  use_dense: true
+  dense_weight: 1.0
+  sparse_weight: 1.0
+
+# ── Structure-aware chunking ─────────────────────────────────────────────
+chunking:
+  max_tokens: 800
+  overlap_tokens: 100
+  min_chunk_tokens: 40
+
+# ── Evidence sufficiency gate (100-pt rubric, 5 x 20) ────────────────────
+sufficiency:
+  dimensions:
+    coverage: 20
+    relevance: 20
+    depth: 20
+    recency: 20
+    consistency: 20
+  threshold: 70              # pass mark out of 100
+  relevance_floor: 0.35      # below this, a chunk's contribution is damped
+  relevance_damp_factor: 0.5
+  min_evidence_items: 3      # short-circuit to "insufficient" below this
+
+# ── Agentic retry + escalation budgets ───────────────────────────────────
+retry:
+  max_retries: 2
+  drift_max_distance: 0.6    # reject reformulations that drift beyond this
+  max_query_variants: 3
+
+# ── Generation (Planner/Researcher/Writer/Critic) ────────────────────────
+generation:
+  planner_temp: 0.4
+  researcher_temp: 0.2
+  writer_temp: 0.6
+  critic_temp: 0.2
+  critic_max_cycles: 2
+  critic_pass_threshold: 70
+  max_regenerations: 1
+
+# ── External academic search (Phase 3, disabled by default) ──────────────
+external:
+  enabled: false
+  providers: [openalex, s2, crossref]
+  openalex_mailto: null      # set a polite-pool email to be a good citizen
+  s2_api_key: null
+  s2_rps: 1                  # Semantic Scholar rate cap
+  max_results_per_provider: 10
+  require_approval: false
+  # When grounding pulls in an online reference (a DOI), save the FULL document
+  # into the corpus if an OA PDF is available (so it resolves to
+  # "Paper · Section" offline); otherwise keep just the title + section/DOI.
+  save_online_to_corpus: true
+
+# ── Neo4j graph-guided expansion (Phase 2, disabled by default) ──────────
+graph_expansion:
+  enabled: false
+  max_additional_chunks: 10
+  max_hops: 1
+
+# ── Visual page retrieval (Phase 4, disabled by default) ─────────────────
+visual:
+  enabled: false
+  model: colsmol              # or "clip"
+  top_pages: 5
+  candidates: 100
+
+# ── Evidence ledger (cache-first decision records) ───────────────────────
+ledger:
+  enabled: true
+  path: null                  # defaults to <data_dir>/ledger.sqlite
+  fingerprint_algo: sha256    # sha256 | sha1 | md5
+  fingerprint_window: 120     # lines of a symbol's source hashed into the fp
+
+# ── MCP server (new plan: Evidence MCP Server) ────────────────────────────
+mcp:
+  allow_ingest: false         # gate the mutating `ingest_paper` tool (off = read-only)
+  max_chunk_chars: 1500       # truncate chunk text in tool results
+  default_search_limit: 8
+  default_citation_limit: 10
+  # When a capable MCP client model is driving the conversation (VS Code Copilot,
+  # Claude, …), set this to true so `answer_research` returns an *evidence bundle*
+  # (chunks + sufficiency score + guidance) for the client to synthesise — instead
+  # of running Evidence's local Planner/Writer/Critic. Default false = full local
+  # pipeline (headless use).
+  prefer_client_generation: false
+
+# ── Storage ──────────────────────────────────────────────────────────────
+data_dir: ~/.evidence         # where indexes + store live
+index_dir: null              # override the index dir explicitly if desired
+# corpus_dir: ./corpus       # optional default corpus directory

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local data — never commit indices, stores, or downloaded corpora
+.evidence/
+*.sqlite
+*.sqlite3
+index/
+corpus/
+*.faiss
+*.pkl
+*.faiss.*
+
+# Logs & env
+*.log
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

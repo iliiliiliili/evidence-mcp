@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evidence"
+version = "0.1.0"
+description = "Open, local-first, evidence-gated multimodal agentic RAG for technical literature (Evidence reimplementation)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Evidence Workshop" }]
+keywords = ["rag", "langgraph", "ollama", "local", "retrieval", "citation"]
+# Fill in before publishing to PyPI:
+# project_urls = {
+#   Homepage = "https://github.com/<org>/evidence",
+#   Repository = "https://github.com/<org>/evidence",
+#   Issues = "https://github.com/<org>/evidence/issues",
+# }
+dependencies = [
+    # orchestration
+    "langgraph>=0.2",
+    # local model access
+    "ollama>=0.4",
+    # retrieval
+    "faiss-cpu>=1.8",
+    "rank-bm25>=0.2",
+    # chunking / tokenization
+    "tiktoken>=0.7",
+    "numpy>=1.26",
+    # structured config
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+    # CLI
+    "typer>=0.12",
+    "rich>=13.7",
+    # external academic search (Phase 3)
+    "httpx>=0.27",
+    # optional: cross-encoder reranker (Phase 1 quality, heavy)
+]
+
+[project.optional-dependencies]
+# Heavy / optional. Install with `pip install evidence[vision]` etc.
+rerank = ["sentence-transformers>=2.6"]
+pdf = ["pymupdf>=1.24"]
+latex = ["latex2mathml>=3.77"]
+vision = ["torch>=2.2", "transformers>=4.40"]  # ColSmol / MUVERA (Phase 4)
+neo4j = ["neo4j>=5.20"]
+# MCP server (new plan): FastMCP-based tool server exposing the pipeline.
+# Pinned to v1 (FastMCP API); mcp 2.x renamed FastMCP → MCPServer.
+mcp = ["mcp>=1.2,<2"]
+dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.10"]
+all = [
+    "evidence[rerank,pdf,latex,vision,neo4j,mcp,dev]",
+]
+
+[project.scripts]
+evidence = "evidence.cli:app"
+evidence-mcp = "evidence.mcp.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "B008",  # Typer/dependency-injection: function call in default argument is the idiom
+]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
