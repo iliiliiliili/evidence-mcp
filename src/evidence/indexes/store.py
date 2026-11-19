@@ -81,6 +81,23 @@ class Store:
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+            -- LLM/deterministic links between chunks (hierarchical navigation).
+            -- src/dst are chunk_ids; relation is a short tag (continuation,
+            -- see_also, depends_on, cites, contrast, example, ...);
+            -- confidence in [0, 1]; reason is a short human-facing sentence.
+            CREATE TABLE IF NOT EXISTS chunk_links (
+                src_chunk_id  TEXT NOT NULL,
+                dst_chunk_id  TEXT NOT NULL,
+                relation      TEXT NOT NULL,
+                confidence    REAL NOT NULL DEFAULT 1.0,
+                reason        TEXT NOT NULL DEFAULT '',
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (src_chunk_id, dst_chunk_id, relation),
+                FOREIGN KEY (src_chunk_id) REFERENCES chunks(chunk_id),
+                FOREIGN KEY (dst_chunk_id) REFERENCES chunks(chunk_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_links_src ON chunk_links(src_chunk_id);
+            CREATE INDEX IF NOT EXISTS idx_links_dst ON chunk_links(dst_chunk_id);
             """
         )
         self._conn.commit()
@@ -178,8 +195,93 @@ class Store:
     def count_chunks(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
 
+    def count_chunks_for_paper(self, paper_id: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks WHERE paper_id=?", (paper_id,)
+        ).fetchone()["n"]
+
     def count_papers(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM papers").fetchone()["n"]
+
+    # ── chunk links (hierarchical / LLM graph) ───────────────────────────
+    def upsert_chunk_link(
+        self,
+        src: str,
+        dst: str,
+        relation: str,
+        confidence: float = 1.0,
+        reason: str = "",
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO chunk_links (src_chunk_id, dst_chunk_id, relation,
+                                     confidence, reason)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(src_chunk_id, dst_chunk_id, relation) DO UPDATE SET
+                confidence=excluded.confidence, reason=excluded.reason
+            """,
+            (src, dst, relation, float(confidence), reason or ""),
+        )
+        self._conn.commit()
+
+    def upsert_chunk_links(
+        self, links: list[dict]
+    ) -> None:
+        for ln in links:
+            self.upsert_chunk_link(
+                ln["src"], ln["dst"], ln["relation"],
+                ln.get("confidence", 1.0), ln.get("reason", ""),
+            )
+
+    def links_for_chunk(
+        self, chunk_id: str, *, direction: str = "out"
+    ) -> list[dict]:
+        """Outgoing (direction='out'), incoming ('in'), or both ('both')."""
+        rows: list[dict] = []
+        if direction in ("out", "both"):
+            for r in self._conn.execute(
+                "SELECT * FROM chunk_links WHERE src_chunk_id=? "
+                "ORDER BY confidence DESC", (chunk_id,),
+            ).fetchall():
+                rows.append(dict(r))
+        if direction in ("in", "both"):
+            for r in self._conn.execute(
+                "SELECT * FROM chunk_links WHERE dst_chunk_id=? "
+                "ORDER BY confidence DESC", (chunk_id,),
+            ).fetchall():
+                rows.append(dict(r))
+        return rows
+
+    def links_for_paper(
+        self, paper_id: str, *, min_confidence: float = 0.0
+    ) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT l.* FROM chunk_links l
+            JOIN chunks c ON c.chunk_id = l.src_chunk_id
+            WHERE c.paper_id = ? AND l.confidence >= ?
+            ORDER BY l.confidence DESC
+            """, (paper_id, min_confidence),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_chunk_links(self, paper_id: str | None = None) -> None:
+        if paper_id is None:
+            self._conn.execute("DELETE FROM chunk_links")
+        else:
+            self._conn.execute(
+                """
+                DELETE FROM chunk_links WHERE
+                    src_chunk_id IN (SELECT chunk_id FROM chunks WHERE paper_id=?)
+                 OR dst_chunk_id IN (SELECT chunk_id FROM chunks WHERE paper_id=?)
+                """, (paper_id, paper_id),
+            )
+        self._conn.commit()
+
+    def count_chunk_links(self) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM chunk_links"
+        ).fetchone()["n"]
 
     # ── kv ────────────────────────────────────────────────────────────────
     def kv_set(self, key: str, value: str) -> None:

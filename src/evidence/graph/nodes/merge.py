@@ -29,9 +29,28 @@ def merge_evidence(state: EvidenceState) -> dict:
     combined = main + graph + visual + external
     merged = dedupe_evidence(combined)
 
-    # Provenance sanity: ensure every item has a provenance dict.
+    # Provenance sanity: ensure every item has a provenance dict + group.
     for ev in merged:
         ev.setdefault("provenance", {})
+        ev.setdefault("group", "")
+
+    # Optional paper-group filter. `allowed_groups` is set by the CLI
+    # (`evidence ask --group A --group B`); when non-empty, drop any evidence
+    # item whose group is not in the set. This lets the user restrict the
+    # generation sub-graph to a named subset of the corpus — the building
+    # block for comparative questions ("what does group A conclude, and how
+    # does that change when we add group B?").
+    allowed = list(state.get("allowed_groups") or [])
+    if allowed:
+        allowed_set = {g.strip() for g in allowed if g and g.strip()}
+        kept = [ev for ev in merged if ev.get("group") in allowed_set]
+        dropped = len(merged) - len(kept)
+        if dropped:
+            logger.info(
+                "merge: allowed_groups=%s filtered out %d items (kept %d)",
+                sorted(allowed_set), dropped, len(kept),
+            )
+        merged = kept
 
     logger.debug(
         "merge: main=%d graph=%d visual=%d external=%d -> %d unique",

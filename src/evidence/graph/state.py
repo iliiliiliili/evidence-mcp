@@ -61,6 +61,12 @@ class EvidenceItem(TypedDict, total=False):
     authors: list[str]
     # Verified claim mapping (stage 11). Empty until verification succeeds.
     verified: bool
+    # Paper's group, derived from the immediate parent folder name of the
+    # paper's file path. Papers in the same folder form a group — useful for
+    # comparative questions ("what does group A conclude vs group B?").
+    # Convention, not config: to group papers, put them in subfolders of the
+    # corpus. External (OpenAlex/S2/Crossref) items get the literal "external".
+    group: str
 
 
 class EvidenceState(TypedDict, total=False):
@@ -79,6 +85,11 @@ class EvidenceState(TypedDict, total=False):
     intent: str  # "content" | "bibliometric" | "trend" | "current_world"
     text_queries: Annotated[list[str], _replace]
     visual_query: str | None
+    # Optional paper-group constraint (see EvidenceItem.group). When non-empty,
+    # `merge_evidence` filters to items whose group is in this set, so the
+    # downstream generation sub-graph only sees evidence from the requested
+    # group(s). Empty / absent = no filter.
+    allowed_groups: Annotated[list[str], _replace]
 
     # ── Loop control ──────────────────────────────────────────────────────
     retries: int

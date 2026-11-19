@@ -18,7 +18,7 @@ import re
 
 from ..state import EvidenceState
 from .context import get_context
-from .plan import _fmt_evidence_block
+from .plan import _corpus_tree, _fmt_evidence_block
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,12 @@ _WRITER_SYSTEM = (
     "3. Do NOT state facts that no evidence item supports. If the evidence is "
     "insufficient for a sub-point, say so explicitly (e.g. 'the provided "
     "evidence does not establish…').\n"
-    "4. Prefer the outline's sections as headings.\n\n"
+    "4. Prefer the outline's sections as headings.\n"
+    "5. Evidence items may carry a `group` label. When the question asks to "
+    "compare or contrast groups, attribute each conclusion to its group "
+    "(e.g. 'Group A concludes …', 'Group B finds …') and make the "
+    "differences explicit. Never blend two groups' claims into one unattributed "
+    "statement.\n\n"
     "Respond with JSON: {\"draft\": str, \"citations\": "
     "[{\"id\": int, \"claim\": str, \"evidence_ref\": int}]}. "
     "evidence_ref is the [E#] index (1-based) the claim draws on."
@@ -61,6 +66,14 @@ def draft(state: EvidenceState) -> dict:
         f"Question: {question}",
         f"Outline:\n{outline}",
     ]
+    # Corpus structure (groups → papers) so the writer can attribute claims
+    # to groups when the question is comparative ("what does group A
+    # conclude, and how does group B change it?"). Always shown — harmless
+    # for non-comparative questions, but it lets the model name groups it
+    # sees in the outline or evidence without the user having to pass --group.
+    tree = _corpus_tree(ctx)
+    if tree:
+        prompt_parts.append(tree)
     if evidence_map.get("map"):
         prompt_parts.append(f"Evidence map:\n{evidence_map['map']}")
     prompt_parts.append(f"Evidence:\n{_fmt_evidence_block(evidence)}")

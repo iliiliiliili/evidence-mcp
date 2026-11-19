@@ -8,6 +8,7 @@ here — and OUT of `server.py` — means the tools are unit-testable without th
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .. import facade
@@ -79,8 +80,116 @@ def verify_claim(claim: str, chunk_id: str, app: facade.AppContext | None = None
 
 
 def get_paper(paper_id: str, app: facade.AppContext | None = None) -> dict | None:
-    """Full paper record + section outline. See facade.get_paper."""
+    """Full paper record + section outline + parsed references.
+
+    `paper_id` may be an exact store id or a title substring. The `title` is
+    the derived display title, and `references` is the paper's bibliography
+    split into individual entries. See facade.get_paper."""
     return facade.get_paper(paper_id, app=app)
+
+
+def get_chunk(chunk_id: str, app: facade.AppContext | None = None) -> dict | None:
+    """The FULL, untruncated text of one chunk + its provenance.
+
+    Use to read an exact passage (a table row, a definition, a reference entry)
+    that `search_corpus` returned truncated. Returns the full text, paper/
+    section/page, and neighbouring chunks for local context. See facade."""
+    return facade.get_chunk(chunk_id, app=app)
+
+
+def get_references(paper_id: str, app: facade.AppContext | None = None) -> list[str]:
+    """The paper's reference list as individual, untruncated entries.
+
+    Structured (split per-entry) and NOT truncated — the clean way to read a
+    bibliography, instead of fishing through `search_corpus` chunks. `paper_id`
+    may be an exact id or a title substring. See facade.get_references."""
+    return facade.get_references(paper_id, app=app)
+
+
+def get_sections(paper_id: str, app: facade.AppContext | None = None) -> list[dict]:
+    """A paper's sections (hierarchical spans) in document order.
+
+    Each section lists its `chunk_ids`, first/last chunk, heading, page, and
+    token count — a coarse-to-fine navigation outline. Use with `get_section`
+    to read one section as a single untruncated unit. See facade."""
+    return facade.get_sections(paper_id, app=app)
+
+
+def get_section(
+    paper_id: str, section_id: str, app: facade.AppContext | None = None
+) -> dict | None:
+    """One section as a single untruncated unit (all its chunks stitched).
+
+    The hierarchical counterpart of `get_chunk`. `section_id` may be the exact
+    id from `get_sections` or a heading substring (e.g. "Method", "Results").
+    Returns the full section text in document order plus the chunk ids that
+    make it up. See facade.get_section."""
+    return facade.get_section(paper_id, section_id, app=app)
+
+
+def build_chunk_links(
+    paper_id: str | None = None,
+    app: facade.AppContext | None = None,
+    reset: bool = True,
+) -> dict:
+    """(Re)build the chunk-graph over the corpus (or one paper).
+
+    Emits deterministic links (adjacent "continuation", same-section "see_also")
+    and, when a local reasoning model is available, semantic LLM links
+    (see_also / depends_on / cites / contrasts / example) with reasons and
+    confidence. Fail-soft: a model error just yields fewer links.
+
+    Returns a report: {papers_processed, links_emitted, llm_links,
+    deterministic_links, skipped}. See evidence.links.build_chunk_links."""
+    from ..links import build_chunk_links as _build
+
+    app = app or facade.get_app()
+    cfg = app.cfg
+    report = _build(
+        app.store, models=app.models, cfg=cfg, paper_id=paper_id, reset=reset
+    )
+    return report.summary()
+
+
+def linked_chunks(
+    chunk_id: str,
+    direction: str = "both",
+    min_confidence: float = 0.0,
+    app: facade.AppContext | None = None,
+) -> dict:
+    """Neighbour chunks of `chunk_id`, with the relation + reason of each link.
+
+    `direction`: "out" (chunks this one points to), "in" (chunks pointing to
+    it), or "both" (default). Each neighbour carries a preview of its text so
+    a client can show the target inline without a second round-trip.
+    See evidence.links.linked_chunks."""
+    from ..links import linked_chunks as _linked
+
+    app = app or facade.get_app()
+    return _linked(
+        chunk_id,
+        store=app.store,
+        direction=direction,
+        min_confidence=min_confidence,
+    )
+
+
+def links_for_paper(
+    paper_id: str,
+    min_confidence: float = 0.0,
+    app: facade.AppContext | None = None,
+) -> dict:
+    """All chunk-links whose source chunk belongs to `paper_id`, confidence-ordered.
+
+    Cross-paper links (e.g. a "cites" edge into another paper's chunk) are
+    included, each with a short preview of both endpoints so a reader can
+    follow the edge without extra calls. See evidence.links.links_for_paper."""
+    from ..links import links_for_paper as _links_paper
+
+    app = app or facade.get_app()
+    return _links_paper(
+        paper_id, store=app.store, min_confidence=min_confidence
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -96,8 +205,23 @@ def search_literature(
 
     `intent` controls sort/strategy: content|bibliometric → most cited;
     trend → publication-year order; current_world → newest first.
+
+    **Identifier fast-path:** if `query` already contains a DOI or an arXiv ID
+    (e.g. "arXiv:2510.05710" or "10.1000/xyz"), it is resolved DIRECTLY to that
+    work (Crossref → OpenAlex) instead of a fuzzy keyword search. This is what
+    makes niche citations resolvable — keyword search surfaces generic surveys
+    for specific prior work, but an identifier pins the exact artifact.
     """
     cfg = cfg or EvidenceConfig.load()
+
+    # Fast-path: resolve an explicit DOI / arXiv identifier directly.
+    ident = _extract_identifier(query)
+    if ident is not None:
+        work = _resolve_identifier(ident, cfg)
+        if work:
+            return [_work_to_citation({**work, "resolved_via": ident,
+                                       "match": "identifier"})]
+
     mailto = cfg.external.openalex_mailto
     s2_key = cfg.external.s2_api_key
 
@@ -230,6 +354,51 @@ def answer_research(question: str, app: facade.AppContext | None = None) -> dict
         "qc_report": result.get("qc_report", {}),
         "sufficiency_decision": result.get("sufficiency_decision"),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Scientific review (structured peer-review of ONE paper)
+# ─────────────────────────────────────────────────────────────────────────
+def review_paper(
+    paper_id: str,
+    *,
+    external: bool | None = None,
+    resolve_limit: int = 25,
+    cfg: EvidenceConfig | None = None,
+) -> dict:
+    """Structured scientific review of a single corpus paper.
+
+    Follows a fixed five-part structure:
+
+      1. **summary** — what the paper is about (problem, contribution, method,
+         headline result).
+      2. **strengths** / **weaknesses** — the paper's merits and shortcomings.
+      3. **incorrect_statements** — statements that look factually wrong,
+         internally contradictory, or misstate a method/theorem (each flagged
+         with a ``confidence`` of high/medium/low and a ``chunk_id`` — these
+         are *candidates to check*, not verdicts).
+      4. **undefined_terms** — terms/acronyms used without a definition
+         (model-identified + a deterministic acronym scan).
+      5. **references** — the paper's reference list, each with a ``relevance``
+         (high/medium/low) and ``role`` (method/comparison/dataset/…). When
+         `external` is enabled each is checked against OpenAlex/S2/Crossref
+         (``resolved.found``) to confirm it is a real, findable work.
+
+    `paper_id` may be an exact store id or a title substring (most-chunked match
+    wins). `external` overrides `cfg.external.enabled` for reference lookups
+    (None = follow config). `resolve_limit` caps how many references are
+    checked externally (high relevance first). Read-only: never mutates the
+    corpus or ledger. Cost: two local model calls (+ optional network); a
+    deterministic fallback keeps it working with no model.
+    """
+    from ..review import review_paper as _review
+
+    return _review(
+        paper_id,
+        external=external,
+        resolve_limit=resolve_limit,
+        cfg=cfg,
+    )
 
 
 def _research_bundle(question: str, app: facade.AppContext) -> dict:
@@ -533,6 +702,79 @@ def paper_outline(paper_id: str, app: facade.AppContext | None = None) -> dict |
 # ─────────────────────────────────────────────────────────────────────────
 # Shared shape helpers
 # ─────────────────────────────────────────────────────────────────────────
+# A DOI: `10.<digits>/<anything>` (optionally prefixed with doi.org/...).
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'\)\]\}<>]+", re.IGNORECASE)
+# An arXiv id: `arXiv:NNNN.NNNN[.vN]` or the bare `NNNN.NNNN[.vN]` (20+ years).
+_ARXIV_RE = re.compile(
+    r"(?:arXiv:\s*)?(\d{4}\.\d{4,5})(?:\.v\d+)?", re.IGNORECASE
+)
+
+
+def _extract_identifier(query: str) -> str | None:
+    """Pull an explicit DOI or arXiv id out of a citation string, if present.
+
+    Returns a normalized identifier (a bare DOI, or a bare arXiv id) or None.
+    A DOI is preferred when both appear (it is unambiguous).
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    doi = _DOI_RE.search(q)
+    if doi:
+        return doi.group(0).rstrip(".,;:")
+    arx = _ARXIV_RE.search(q)
+    if arx:
+        return arx.group(1)
+    return None
+
+
+def _resolve_identifier(ident: str, cfg: EvidenceConfig | None = None) -> dict | None:
+    """Resolve a DOI or arXiv id to a normalized work dict (fail-soft → None).
+
+    Tries Crossref, then OpenAlex, then Semantic Scholar. Each provider is
+    best-effort; the first hit that returns a title wins.
+    """
+    doi = ident if ident.startswith("10.") else None
+    arxiv = None
+    if not doi:
+        # Only treat it as an arXiv id if it looks like one (digits + dot).
+        if re.fullmatch(r"\d{4}\.\d{4,5}", ident):
+            arxiv = ident
+    mailto = cfg.external.openalex_mailto if cfg else None
+    s2_key = cfg.external.s2_api_key if cfg else None
+
+    # 1) Crossref (DOI).
+    if doi:
+        try:
+            w = crossref.get_work(doi, mailto=mailto)
+            if w and (w.get("title") or w.get("id")):
+                w["source"] = "crossref"
+                return w
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+    # 2) OpenAlex (DOI).
+    if doi:
+        try:
+            w = openalex.get_work(f"doi:{doi}", mailto=mailto)
+            if w and (w.get("title") or w.get("id")):
+                w["source"] = "openalex"
+                return w
+        except Exception:  # noqa: BLE001
+            pass
+    # 3) Semantic Scholar (arXiv id).
+    if arxiv:
+        try:
+            w = semantic_scholar.get_paper(arxiv, api_key=s2_key)
+            if w and (w.get("title") or w.get("id")):
+                w["source"] = "s2"
+                if not w.get("doi"):
+                    w["doi"] = f"10.48550/arXiv.{arxiv}"
+                return w
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
 def _work_to_citation(w: dict[str, Any]) -> dict:
     """Normalize an external work record into the plan's citation shape."""
     cited_by = (
@@ -540,7 +782,7 @@ def _work_to_citation(w: dict[str, Any]) -> dict:
         or w.get("citations")
         or w.get("is-referenced-by-count")
     )
-    return {
+    out = {
         "paper": w.get("title") or w.get("display_name") or "",
         "year": w.get("year"),
         "doi": w.get("doi"),
@@ -549,3 +791,9 @@ def _work_to_citation(w: dict[str, Any]) -> dict:
         "abstract": (w.get("abstract") or "")[:500],
         "source": w.get("source", ""),
     }
+    # Preserve fast-path provenance (identifier resolution) when present.
+    if w.get("resolved_via"):
+        out["resolved_via"] = w["resolved_via"]
+    if w.get("match"):
+        out["match"] = w["match"]
+    return out

@@ -188,11 +188,22 @@ class Evidence:
         return builder.compile(checkpointer=checkpointer)
 
     # ── public API ────────────────────────────────────────────────────────
-    def ask(self, question: str, *, thread_id: str | None = None, stream: bool = False):
+    def ask(
+        self,
+        question: str,
+        *,
+        thread_id: str | None = None,
+        stream: bool = False,
+        allowed_groups: list[str] | None = None,
+    ):
         """Run the full pipeline on a question.
 
         Returns the final state dict (or a generator of state updates if
         `stream=True`).
+
+        `allowed_groups` (optional) restricts the evidence to papers whose
+        group (folder name) is in the set — see `merge_evidence` for the
+        filter. Used for comparative analysis across paper groups.
         """
         config = {"configurable": {"thread_id": thread_id or "default"}}
         input_state: EvidenceState = {
@@ -205,6 +216,7 @@ class Evidence:
             "citations_dropped": [],
             "external_used": [],
             "retrieval_shortcomings": [],
+            "allowed_groups": list(allowed_groups or []),
         }
         if stream:
             return self.graph.stream(input_state, config=config)

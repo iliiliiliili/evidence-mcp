@@ -10,6 +10,14 @@ Commands:
   evidence ledger export     Color-coded terminal view; -f md|json writes a file.
   evidence ledger impact     Show which decisions are affected by a symbol/chunk/DOI.
   evidence ledger symbols    List symbols that have a decision record (+status/evidence).
+  evidence review <paper>    Structured scientific review (summary/strengths/
+                             weaknesses/incorrect/undefined terms + references).
+  evidence references <p>    A paper's bibliography as clean, untruncated entries.
+  evidence chunk <chunk_id>  Read one chunk's full, untruncated text + context.
+  evidence sections <p>      A paper's section outline (hierarchical navigation).
+  evidence section <p> <sec> Read one section as a single untruncated unit.
+  evidence build-links [p]   Build the chunk-graph (deterministic + LLM links).
+  evidence links <chunk|p>   Show the chunk-graph around a chunk or a paper.
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ from .models.ollama import Models
 app = typer.Typer(
     name="evidence",
     help="Local-first, evidence-gated agentic RAG for technical literature.",
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=True,
 )
 console = Console()
@@ -623,8 +631,40 @@ def ask(
         "--timings",
         help="Report the wall-clock time spent in each pipeline stage after the answer.",
     ),
+    group: list[str] = typer.Option(
+        [],
+        "--group", "-g",
+        help=(
+            "Restrict evidence to paper group(s) (the folder name the paper "
+            "was ingested from). Repeatable. When set, the pipeline only uses "
+            "chunks from papers in those folders — useful for comparative "
+            "questions like 'what does group A conclude, and how does group B "
+            "change it?'."
+        ),
+    ),
+    no_citations: bool = typer.Option(
+        False,
+        "--no-citations",
+        help=(
+            "Skip the verified citation table that is normally printed after "
+            "the answer (each [C<n>] resolved to its paper, section, a short "
+            "quote, and the filename / DOI)."
+        ),
+    ),
 ):
-    """Run the full pipeline and print the cited, QC'd answer."""
+    """Run the full pipeline and print the cited, QC'd answer.
+
+    \b
+    Options:
+      --group, -g     Restrict to one or more paper groups (folder names).
+                      Repeatable. Papers in the same folder form a group;
+                      external works belong to the "external" group.
+      --no-citations  Skip the citation table (printed by default).
+
+    After the answer, a citation table maps every [C<n>] marker to the
+    paper it came from, the section within that paper, a short quote from
+    the supporting chunk, and the filename / DOI.
+    """
     _setup_logging(verbose)
     cfg = _load_config(config)
     index_dir = cfg.resolved_index_dir
@@ -636,7 +676,10 @@ def ask(
         raise typer.Exit(code=1)
 
     app_ = _build_app(cfg)
-    console.print(f"[bold]Question:[/bold] {question}\n")
+    console.print(f"[bold]Question:[/bold] {question}")
+    if group:
+        console.print(f"[dim]groups: {', '.join(group)}[/dim]")
+    console.print()
     result: dict = {}
     # Per-stage wall time (seconds) and call count, both accumulated per node
     # name (a node may run more than once across retry/regeneration loops).
@@ -662,7 +705,11 @@ def ask(
             transient=True,
         ) as progress:
             task_id = progress.add_task("starting pipeline…", total=None)
-            for update in app_.ask(question, stream=True):
+            for update in app_.ask(
+                question,
+                stream=True,
+                allowed_groups=group or None,
+            ):
                 for node, payload in update.items():
                     if stream and isinstance(payload, dict) and payload:
                         console.print(f"[dim]{node}:[/dim] " + _brief(payload))
@@ -681,7 +728,10 @@ def ask(
         err_console.print("[red]interrupted[/red]")
         raise typer.Exit(code=130) from None
 
-    _print_answer(result)
+    # Pass the store so `_print_answer` can resolve each [C<n>] to its
+    # paper/section/quote. Honor --no-citations by passing store=None.
+    store_for_citations = None if no_citations else getattr(app_, "store", None)
+    _print_answer(result, store=store_for_citations)
     if timings:
         _print_timings(stage_order, stage_times, stage_counts)
 
@@ -742,7 +792,7 @@ def _print_timings(
     console.print(table)
 
 
-def _print_answer(result: dict) -> None:
+def _print_answer(result: dict, *, store=None) -> None:
     from rich.markdown import Markdown
 
     intent = result.get("intent")
@@ -766,11 +816,183 @@ def _print_answer(result: dict) -> None:
     answer = result.get("answer") or "(no answer produced)"
     console.print(Markdown(answer))
 
+    # Default-on citation table: every verified [C<n>] marker resolved to
+    # its paper, section, a short quote, and the filename / DOI. Pass
+    # `store=None` (e.g. from a test harness) to skip the resolution.
+    if store is not None:
+        _print_citation_table(result, store)
+
+
+def _print_citation_table(result: dict, store) -> None:
+    """Render the verified citation list as a human-readable table.
+
+    Each row is `[C<n>] <paper title> — <section>  "<quote>"  <filename · DOI>`
+    (the exact format requested: marker, paper title, section title, short
+    quote, and the source identifier). Dropped citations — those the
+    citation-integrity stage could not resolve to a real chunk — are listed
+    below the table as a dimmed note so the reader knows which inline
+    markers had no grounded source.
+    """
+    verified = result.get("citations") or []
     dropped = result.get("citations_dropped") or []
+
+    if not verified and not dropped:
+        return
+
+    if verified:
+        from pathlib import Path
+
+        table = Table(
+            title="Citations",
+            title_style="bold",
+            border_style="dim",
+            show_lines=False,
+            pad_edge=False,
+        )
+        table.add_column("#", style="dim", width=4, justify="right")
+        table.add_column("Paper", ratio=2, overflow="fold")
+        table.add_column("Section", ratio=1, overflow="fold")
+        table.add_column("Quote", ratio=4, overflow="fold", style="italic")
+        table.add_column("Source", ratio=2, overflow="fold", style="dim")
+
+        # Stable order: by marker id (C1, C2, …). `id` may be int or str.
+        def _key(c: dict) -> int:
+            cid = c.get("id")
+            try:
+                return int(cid)
+            except (TypeError, ValueError):
+                return 999999
+
+        from .graph.nodes.evidence_util import (
+            _derived_paper_title,
+            _is_weak_title_stem,
+        )
+
+        for c in sorted(verified, key=_key):
+            cid = c.get("id")
+            chunk_id = str(c.get("chunk_id", "")).strip()
+            paper = None
+            chunk = None
+            if chunk_id:
+                chunk = store.get_chunk(chunk_id)
+                if chunk is not None:
+                    paper = store.get_paper(chunk.paper_id)
+            # Prefer a real title. When the stored title is just a filename
+            # stem (e.g. `11299`), derive one from the paper's first chunk.
+            if paper and _is_weak_title_stem(paper.title):
+                derived = _derived_paper_title(paper, store)
+                title = derived or paper.title
+            else:
+                title = (paper.title if paper and paper.title else (c.get("paper_id") or chunk_id))
+            section = (chunk.heading if chunk else "") or "(no section)"
+            quote = (chunk.text if chunk else (c.get("claim") or "")) or "—"
+            quote = " ".join(str(quote).split())
+            if len(quote) > 220:
+                quote = quote[:220] + "…"
+            src_parts: list[str] = []
+            if paper and paper.path:
+                src_parts.append(Path(paper.path).name)
+            if paper and paper.doi:
+                src_parts.append(paper.doi)
+            src = " · ".join(src_parts) if src_parts else "—"
+            table.add_row(f"C{cid}", title, section, f"“{quote}”", src)
+        console.print(table)
+
     if dropped:
         console.print(
-            f"\n[dim]({len(dropped)} citation(s) could not be verified and were dropped)[/dim]"
+            f"\n[dim]{len(dropped)} citation(s) could not be verified and were dropped:[/dim]"
         )
+        for d in dropped:
+            cid = d.get("id", "?")
+            reason = d.get("reason", "unresolved")
+            console.print(f"  [dim]- C{cid}: {reason}[/dim]")
+        console.print()
+
+
+# ── papers (list the corpus tree as paper groups) ─────────────────────────
+@app.command()
+def papers(
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+    group: str | None = typer.Option(
+        None,
+        "--group", "-g",
+        help="Only show papers in this group (folder name).",
+    ),
+):
+    """List the indexed corpus as a tree of paper groups.
+
+    A paper's *group* is the name of its immediate parent folder — the same
+    grouping `evidence ask --group` filters on. This is the fast, deterministic
+    way to answer "what's in the corpus?" (no retrieval, no LLM): it reads the
+    store directly.
+
+    \b
+    Examples:
+      evidence papers                 # all groups + papers
+      evidence papers -g finance      # only the 'finance' group
+    """
+    cfg = _load_config(config)
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {cfg.resolved_index_dir}.[/yellow]\n"
+            f"Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .graph.nodes.evidence_util import _best_title, group_from_path
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        rows = []
+        for p in store.list_papers():
+            grp = group_from_path(p.path) or "(root)"
+            if group and grp != group:
+                continue
+            rows.append((grp, p))
+
+        # Group rows by group, preserving store order within each group.
+        by_group: dict[str, list] = {}
+        for grp, p in rows:
+            by_group.setdefault(grp, []).append(p)
+
+        if not rows:
+            console.print(
+                "[yellow]No papers[/yellow]"
+                + (f" in group [bold]{group}[/bold]." if group else ".")
+            )
+            return
+
+        n_groups = len(by_group)
+        n_papers = sum(len(v) for v in by_group.values())
+        for grp, plist in sorted(by_group.items(), key=lambda kv: kv[0].lower()):
+            table = Table(
+                title=f"group: {grp}  ·  {len(plist)} paper(s)",
+                title_style="bold cyan",
+                border_style="dim",
+                show_lines=False,
+                pad_edge=False,
+            )
+            table.add_column("title", overflow="fold")
+            table.add_column("path", style="dim", overflow="fold")
+            table.add_column("chunks", justify="right")
+            table.add_column("year", justify="right")
+            table.add_column("doi", style="dim", overflow="fold")
+            for p in plist:
+                table.add_row(
+                    _best_title(p, store) or p.title or p.path,
+                    p.path,
+                    str(store.count_chunks_for_paper(p.paper_id)),
+                    str(p.year) if p.year else "",
+                    p.doi or "",
+                )
+            console.print(table)
+
+        console.print(
+            f"\n[dim]{n_papers} paper(s) across {n_groups} group(s). "
+            f"Use `evidence ask --group <name>` to restrict a question to a group.[/dim]"
+        )
+    finally:
+        store.close()
 
 
 # ── build-knowledge-graph ─────────────────────────────────────────────────
@@ -890,6 +1112,639 @@ def eval(
     if output:
         output.write_text(json.dumps(report, indent=2), encoding="utf-8")
         console.print(f"[green]report written:[/green] {output}")
+
+
+# ── review (structured scientific review of one paper) ──────────────────────
+@app.command()
+def review(
+    paper: str = typer.Argument(
+        ...,
+        help="Paper id (exact store id) or a title substring to match.",
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+    external: bool | None = typer.Option(
+        None,
+        "--external/--no-external",
+        help=(
+            "Enable/disable external reference lookup (OpenAlex/S2/Crossref). "
+            "Default follows `cfg.external.enabled`."
+        ),
+    ),
+    resolve_limit: int = typer.Option(
+        25, "--resolve-limit", help="Max references to check externally (high first)."
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", "-o", help="Write the review as Markdown to this path."
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the full structured report as JSON."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Produce a structured scientific (peer) review of ONE paper.
+
+    The review follows a fixed five-part structure:
+
+      1. **Summary**        — problem, contribution, method, headline result.
+      2. **Strengths**      — the paper's merits.
+      3. **Weaknesses**     — its shortcomings.
+      4. **Incorrect?**     — candidate factual errors / contradictions /
+                            misused methods (each with a confidence + chunk).
+      5. **Undefined terms** — terms/acronyms used without a definition.
+
+    and a **References** table — the paper's reference list, each row with a
+    relevance (high/medium/low) and role, plus whether the work was found in
+    the external literature sources (when `--external` is on).
+
+    \b
+    Examples:
+      evidence review "Attention-based Sequence Models"
+      evidence review p1 --external            # also check references online
+      evidence review p1 -o review.md          # write a Markdown report
+
+    Read-only: it never modifies the corpus or the ledger.
+    """
+    _setup_logging(verbose)
+    cfg = _load_config(config)
+    index_dir = cfg.resolved_index_dir
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {index_dir}.[/yellow]\n"
+            f"Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .review import ReviewService, resolve_paper
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        resolved = resolve_paper(store, paper)
+        if resolved is None:
+            err_console.print(f"[red]paper not found:[/red] {paper}")
+            console.print("[dim]Run `evidence papers` to list indexed papers.[/dim]")
+            raise typer.Exit(code=1)
+        pid, p = resolved
+        console.print(
+            f"[bold]Reviewing[/bold] [cyan]{p.title or p.path}[/cyan]"
+            + (f" [dim]({pid})[/dim]" if pid != paper else "")
+            + f"  [dim]model [cyan]{cfg.ollama.reasoning}[/cyan][/]"
+            + (
+                "  [dim]external references [bold]on[/bold][/]"
+                if (cfg.external.enabled if external is None else external)
+                else "  [dim]external references off[/dim]"
+            )
+        )
+        report = ReviewService(cfg, store=store).review(
+            pid, external=external, resolve_limit=resolve_limit
+        )
+    finally:
+        store.close()
+
+    if json_out:
+        print(json.dumps(report.as_dict(), indent=2))
+        return
+
+    _print_review(report)
+
+    if output:
+        output.write_text(report.to_markdown(), encoding="utf-8")
+        console.print(f"[green]review written:[/green] {output}")
+
+
+# ── references (a paper's bibliography, structured + untruncated) ────────────
+@app.command("references")
+def references(
+    paper: str = typer.Argument(
+        ..., help="Paper id (exact) or a title substring."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """Print a paper's reference list as clean, untruncated entries.
+
+    Reads the References/Bibliography section (or the final chunks), joins it
+    in document order, and splits it into per-entry strings (numbering kept).
+    This is the structured, non-truncated way to read a bibliography — far more
+    reliable than pulling fragments from `search_corpus`. Read-only, no model.
+
+    \b
+    Examples:
+      evidence references "Attention-based Sequence Models"
+      evidence references p1
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    index_dir = cfg.resolved_index_dir
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {index_dir}.[/yellow]\n"
+            f"Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import _resolve_paper
+    from .indexes.store import Store
+    from .review import references_text, split_references
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        p = _resolve_paper(store, paper)
+        if p is None:
+            err_console.print(f"[red]paper not found:[/red] {paper}")
+            raise typer.Exit(code=1)
+        chunks = store.chunks_for_paper(p.paper_id)
+        entries = split_references(references_text(chunks))
+        if not entries:
+            console.print("[yellow]no reference section found in this paper's chunks[/yellow]")
+            raise typer.Exit(code=0)
+        console.print(
+            Panel(
+                f"[bold]{p.title or p.path}[/bold]",
+                title=f"References · {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}",
+                border_style="cyan", expand=False,
+            )
+        )
+        for e in entries:
+            console.print(f"[cyan]•[/cyan] {e}")
+    finally:
+        store.close()
+
+
+# ── chunk (read one chunk in full) ──────────────────────────────────────────
+@app.command()
+def chunk(
+    chunk_id: str = typer.Argument(..., help="A chunk id, e.g. `p1::c7` or `online__doi__...#c3`."),
+    context: bool = typer.Option(
+        True, "--context/--no-context", help="Show neighbouring chunks for local context."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """Print ONE chunk's FULL, untruncated text + provenance (+ neighbours).
+
+    The "give me chunk X" command: read an exact passage (a table row, a
+    definition, a reference entry) that `search_corpus` only returned truncated.
+    Read-only, no model.
+
+    \b
+    Examples:
+      evidence chunk p1::c7
+      evidence chunk p1::c7 --no-context
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    index_dir = cfg.resolved_index_dir
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {index_dir}.[/yellow]\n"
+            f"Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import get_chunk
+
+    rec = get_chunk(chunk_id)
+    if rec is None:
+        err_console.print(f"[red]chunk not found:[/red] {chunk_id}")
+        raise typer.Exit(code=1)
+
+    meta_bits = [rec.get("paper") or rec["paper_id"]]
+    if rec.get("section"):
+        meta_bits.append(rec["section"])
+    if rec.get("page"):
+        meta_bits.append(f"p.{rec['page']}")
+    if rec.get("doi"):
+        meta_bits.append(f"DOI {rec['doi']}")
+    console.print(Panel(
+        " · ".join(meta_bits),
+        title=f"chunk {chunk_id} · {rec.get('tokens', '?')} tokens",
+        border_style="cyan", expand=False,
+    ))
+    console.print(rec["text"])
+    if context and rec.get("context"):
+        console.print("\n[dim]── neighbouring chunks ──[/dim]")
+        for c in rec["context"]:
+            head = c.get("section") or "(no section)"
+            if c.get("page"):
+                head += f" · p.{c['page']}"
+            console.print(f"[dim]{c['chunk_id']}[/dim] [dim]({head})[/dim]")
+            console.print(f"  [dim]{c['text'][:200]}{'…' if len(c['text']) > 200 else ''}[/dim]")
+
+
+# ── sections (hierarchical outline) ────────────────────────────────────────
+@app.command()
+def sections(
+    paper: str = typer.Argument(
+        ..., help="Paper id (exact) or a title substring."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """Print a paper's sections as a coarse-to-fine navigation outline.
+
+    Each section lists its heading, page, chunk count, token count, and the
+    chunk ids that make it up. Follow up with `evidence section <paper> <sec>`
+    to read a section in full. Read-only, no model.
+
+    \b
+    Examples:
+      evidence sections p1
+      evidence sections "FinLLM-KG"
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {cfg.resolved_index_dir}[/yellow]\n"
+            "Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import _resolve_paper, get_sections
+    from .indexes.store import Store
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        p = _resolve_paper(store, paper)
+        if p is None:
+            err_console.print(f"[red]paper not found:[/red] {paper}")
+            raise typer.Exit(code=1)
+        secs = get_sections(p.paper_id, app=None)
+        if not secs:
+            err_console.print("[yellow]no sections found for this paper[/yellow]")
+            raise typer.Exit(code=0)
+        body = Table(title=f"{p.title or p.path} — {len(secs)} sections")
+        body.add_column("#", justify="right", style="dim")
+        body.add_column("section", style="cyan")
+        body.add_column("page", justify="right")
+        body.add_column("chunks", justify="right")
+        body.add_column("tokens", justify="right")
+        body.add_column("section_id")
+        for i, s in enumerate(secs, start=1):
+            body.add_row(
+                str(i),
+                s.get("heading") or "(untitled)",
+                str(s.get("page") if s.get("page") is not None else "—"),
+                str(s.get("n_chunks", 0)),
+                str(s.get("tokens", 0)),
+                f"[dim]{s['section_id']}[/dim]",
+            )
+        console.print(Panel(
+            f"read one with: [bold]evidence section {p.paper_id} <section_id>[/bold]",
+            border_style="cyan", expand=False,
+        ))
+        console.print(body)
+    finally:
+        store.close()
+
+
+@app.command()
+def section(
+    paper: str = typer.Argument(..., help="Paper id (exact) or a title substring."),
+    section_id: str = typer.Argument(
+        ..., help="Section id (from `evidence sections`) or a heading substring."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """Print ONE section as a single untruncated unit (all its chunks stitched).
+
+    The hierarchical counterpart of `evidence chunk` — read a whole section
+    (Method, Results, References, …) cleanly, in document order. Read-only.
+
+    \b
+    Examples:
+      evidence section p1 sec2
+      evidence section "FinLLM-KG" Method
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {cfg.resolved_index_dir}[/yellow]\n"
+            "Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import get_section
+
+    rec = get_section(paper, section_id)
+    if rec is None:
+        err_console.print(f"[red]section not found:[/red] {paper} / {section_id}")
+        raise typer.Exit(code=1)
+
+    bits = [rec.get("paper") or rec["paper_id"]]
+    if rec.get("page") is not None:
+        bits.append(f"p.{rec['page']}")
+    bits.append(f"{rec.get('n_chunks', '?')} chunks")
+    console.print(Panel(
+        " · ".join(bits),
+        title=f"{rec.get('heading') or rec['section_id']} · {rec.get('tokens', '?')} tokens",
+        border_style="cyan", expand=False,
+    ))
+    console.print(rec["text"])
+    console.print(f"\n[dim]chunks: {', '.join(rec.get('chunk_ids', []))}[/dim]")
+
+
+# ── chunk graph (links) ─────────────────────────────────────────────────────
+@app.command("build-links")
+def build_links(
+    paper: str | None = typer.Argument(
+        None, help="Scope to one paper (exact id or title substring). Omit for the whole corpus."
+    ),
+    reset: bool = typer.Option(
+        True, "--reset/--no-reset", help="Wipe existing links first (scoped to `paper` if given)."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """(Re)build the chunk-graph: deterministic + (if available) LLM links.
+
+    Always emits deterministic links (adjacent 'continuation', same-section
+    'see_also'); adds semantic LLM links (see_also/depends_on/cites/contrasts/
+    example) when a local reasoning model is reachable. Fail-soft — a model
+    error just yields fewer links, never a crash.
+
+    \b
+    Examples:
+      evidence build-links
+      evidence build-links p1
+      evidence build-links p1 --no-reset
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {cfg.resolved_index_dir}[/yellow]\n"
+            "Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import _resolve_paper
+    from .indexes.store import Store
+    from .links import build_chunk_links
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        paper_id = paper
+        if paper_id is not None:
+            p = _resolve_paper(store, paper_id)
+            paper_id = p.paper_id if p else paper_id
+        from .models.ollama import Models
+
+        models = Models(cfg)
+        report = build_chunk_links(
+            store, models=models, cfg=cfg, paper_id=paper_id, reset=reset
+        )
+        s = report.summary()
+        console.print(Panel(
+            f"[green]✓[/green] processed [bold]{s['papers_processed']}[/bold] paper(s)\n"
+            f"  links emitted: [bold]{s['links_emitted']}[/bold] "
+            f"(deterministic {s['deterministic_links']}, LLM {s['llm_links']})\n"
+            f"  total links in store: [bold]{store.count_chunk_links()}[/bold]",
+            title="chunk-graph build",
+            border_style="green" if s["papers_processed"] else "yellow", expand=False,
+        ))
+        if s.get("skipped"):
+            console.print(f"[yellow]skipped:[/yellow] {', '.join(s['skipped'])}")
+    finally:
+        store.close()
+
+
+@app.command()
+def links(
+    target: str = typer.Argument(
+        ...,
+        help="A chunk id (e.g. `p1::c3`) or a paper id / title substring.",
+    ),
+    direction: str = typer.Option(
+        "both", "--direction", "-d", help="out | in | both (for chunk targets)."
+    ),
+    min_confidence: float = typer.Option(
+        0.0, "--min-confidence", help="Drop links below this confidence."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """Show the chunk-graph around a chunk (its links + neighbours) or a paper.
+
+    Auto-detects the target kind: if `target` is a chunk id it shows that
+    chunk's neighbours (with relation + reason + preview); if it resolves to a
+    paper it lists every link sourced from that paper, confidence-ordered,
+    with short previews of both endpoints. Read-only.
+
+    \b
+    Examples:
+      evidence links p1::c3
+      evidence links p1::c3 --direction out
+      evidence links p1
+      evidence links "FinLLM-KG" --min-confidence 0.6
+    """
+    _setup_logging(False)
+    cfg = _load_config(config)
+    if not cfg.resolved_store_path.exists():
+        err_console.print(
+            f"[yellow]No index found at {cfg.resolved_index_dir}[/yellow]\n"
+            "Run [bold]evidence ingest[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    from .facade import _resolve_paper
+    from .indexes.store import Store
+    from .links import linked_chunks, links_for_paper
+
+    store = Store(cfg.resolved_store_path)
+    try:
+        # Chunk target?
+        if store.get_chunk(target) is not None:
+            res = linked_chunks(
+                target,
+                store=store,
+                direction=direction,
+                min_confidence=min_confidence,
+            )
+            if not res["neighbours"]:
+                console.print(
+                    "[yellow]no links found for this chunk yet — run "
+                    "[bold]evidence build-links[/bold] first.[/yellow]"
+                )
+                raise typer.Exit(code=0)
+            console.print(
+                Panel(
+                    f"chunk [bold]{target}[/bold] · {res['n_neighbours']} neighbour(s)",
+                    title=f"links ({direction})", border_style="cyan", expand=False,
+                )
+            )
+            for n in res["neighbours"]:
+                rels = ", ".join(sorted({lk["relation"] for lk in n["links"]}))
+                head = [n.get("paper_id") or "?", n.get("heading") or "(no heading)"]
+                if n.get("page") is not None:
+                    head.append(f"p.{n['page']}")
+                head_s = " · ".join(head)
+                console.print(
+                    f"[cyan]→ {n['chunk_id']}[/cyan] [dim]({head_s})[/dim] "
+                    f"[green]({rels})[/green]"
+                )
+                for lk in n["links"]:
+                    if lk.get("reason"):
+                        conf = lk["confidence"]
+                        console.print(
+                            f"    [dim]{lk['relation']} ({conf:.2f}): {lk['reason']}[/dim]"
+                        )
+                if n.get("preview"):
+                    prev = n["preview"]
+                    console.print(
+                        f"    [dim]{prev[:160]}{'…' if len(prev) > 160 else ''}[/dim]"
+                    )
+            raise typer.Exit(code=0)
+
+        # Paper target.
+        p = _resolve_paper(store, target)
+        if p is None:
+            err_console.print(f"[red]not a known chunk or paper:[/red] {target}")
+            raise typer.Exit(code=1)
+        res = links_for_paper(p.paper_id, store=store, min_confidence=min_confidence)
+        if not res["links"]:
+            console.print(
+                "[yellow]no links found for this paper yet — run "
+                "[bold]evidence build-links[/bold] first.[/yellow]"
+            )
+            raise typer.Exit(code=0)
+        console.print(Panel(
+            f"[bold]{p.title or p.path}[/bold] · {res['n_links']} link(s)",
+            title="chunk-graph", border_style="cyan", expand=False,
+        ))
+        for ln in res["links"]:
+            src = (ln.get("src_preview") or "")[:60].replace("\n", " ")
+            dst = (ln.get("dst_preview") or "")[:60].replace("\n", " ")
+            cross = (
+                ""
+                if ln.get("dst_paper_id") == p.paper_id
+                else f" → {ln['dst_paper_id']}"
+            )
+            console.print(
+                f"[green]{ln['relation']}[/green] [{ln['confidence']:.2f}] "
+                f"[dim]{src}[/dim] ⤳ [dim]{dst}[/dim]{cross}"
+            )
+            if ln.get("reason"):
+                console.print(f"    [dim]{ln['reason']}[/dim]")
+    finally:
+        store.close()
+
+
+def _print_review(report) -> None:
+    """Render a ReviewReport to the terminal (readable, no markdown fences)."""
+    from rich.markdown import Markdown
+
+    # Header meta line.
+    meta_bits: list[str] = []
+    if report.authors:
+        a = report.authors
+        meta_bits.append(a[0] + (" et al." if len(a) > 1 else ""))
+    if report.year:
+        meta_bits.append(str(report.year))
+    if report.doi:
+        meta_bits.append(f"DOI {report.doi}")
+    meta = " · ".join(meta_bits)
+    console.print(Panel(
+        f"[bold]{report.title or report.paper_id}[/bold]"
+        + (f"\n[dim]{meta}[/dim]" if meta else "")
+        + f"\n[dim]{report.n_chunks} indexed section(s)[/dim]",
+        title="Scientific Review",
+        border_style="cyan",
+        expand=False,
+    ))
+
+    # 1. summary
+    console.print("\n[bold cyan]1 · Summary[/bold cyan]")
+    console.print(Markdown(report.summary or "_(no summary)_"))
+
+    # 2. strengths
+    console.print("\n[bold green]2 · Strengths[/bold green]")
+    for s in report.strengths or ["_(none recorded)_"]:
+        console.print(f"  [green]+[/green] {s}")
+
+    # 3. weaknesses
+    console.print("\n[bold yellow]3 · Weaknesses[/bold yellow]")
+    for w in report.weaknesses or ["_(none recorded)_"]:
+        console.print(f"  [yellow]−[/yellow] {w}")
+
+    # 4. incorrect statements
+    console.print("\n[bold red]4 · Possibly incorrect statements[/bold red]")
+    if report.incorrect_statements:
+        conf_style = {"high": "red", "medium": "yellow", "low": "dim"}
+        for s in report.incorrect_statements:
+            conf = str(s.get("confidence") or "").lower()
+            style = conf_style.get(conf, "white")
+            stmt = s.get("statement", "")
+            problem = s.get("problem", "")
+            loc = s.get("chunk_id", "") or s.get("context", "") or "—"
+            console.print(f"  [{style}]{conf or '?':>6}[/]")
+            console.print(f"      [bold]{stmt}[/bold]")
+            if problem:
+                console.print(f"      [dim]{problem}[/dim]")
+            console.print(f"      [dim]{loc}[/dim]")
+        console.print(
+            "  [dim]Model-flagged candidates — verify each against the paper.[/dim]"
+        )
+    else:
+        console.print("  [dim]None flagged.[/dim]")
+
+    # 5. undefined terms
+    console.print("\n[bold cyan]5 · Undefined terms[/bold cyan]")
+    if report.undefined_terms:
+        for t in report.undefined_terms:
+            term = t.get("term", "")
+            ctx = t.get("context", "") or ""
+            sug = t.get("suggestion", "") or ""
+            line = f"  [bold]{term}[/bold]"
+            if ctx:
+                line += f"  [dim]{ctx}[/dim]"
+            console.print(line)
+            if sug:
+                console.print(f"      [dim]→ {sug}[/dim]")
+    else:
+        console.print("  [dim]None identified.[/dim]")
+
+    # 6. references
+    console.print("\n[bold cyan]6 · References[/bold cyan]")
+    if report.references:
+        table = Table(pad_edge=False, show_lines=False)
+        table.add_column("#", justify="right", width=4, style="dim")
+        table.add_column("Reference", ratio=3, overflow="fold")
+        table.add_column("Year", width=5, justify="right")
+        table.add_column("Relevance", width=9)
+        table.add_column("Role", ratio=1, overflow="fold")
+        table.add_column("Resolved", ratio=2, overflow="fold", style="dim")
+        rel_style = {"high": "green", "medium": "yellow", "low": "dim"}
+        for r in report.references:
+            ref = r.get("title") or r.get("authors") or "—"
+            if r.get("authors") and r["authors"] != r.get("title"):
+                ref += f" — {r['authors']}"
+            rel = r.get("relevance", "")
+            resolved = r.get("resolved") or {}
+            if resolved.get("found") is True:
+                res = "[green]found[/green]"
+                if resolved.get("citations") is not None:
+                    res += f" ({resolved['citations']} cites)"
+            elif resolved.get("found") is False:
+                res = "[red]not found[/red]"
+            else:
+                res = "[dim]—[/dim]"
+            table.add_row(
+                str(r.get("index", "")),
+                ref + (f"\n[dim]{r['doi']}[/dim]" if r.get("doi") else ""),
+                str(r.get("year") or ""),
+                f"[{rel_style.get(rel, 'white')}]{rel}[/]",
+                r.get("role", ""),
+                res,
+            )
+        console.print(table)
+    else:
+        console.print("  [dim]No references identified.[/dim]")
+
+    if report.notes:
+        console.print("\n[dim]── notes ──[/dim]")
+        for n in report.notes:
+            console.print(f"[dim]{n}[/dim]")
+    console.print(
+        "\n[dim]Tip: write this review to a file → "
+        "[bold]evidence review <paper> -o review.md[/bold][/dim]"
+    )
 
 
 # ── status ────────────────────────────────────────────────────────────────

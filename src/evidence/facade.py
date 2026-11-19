@@ -21,7 +21,10 @@ from __future__ import annotations
 from .config import EvidenceConfig
 from .graph.nodes.citations import verify_claim as _verify_claim
 from .graph.nodes.context import NodeContext, set_context
-from .graph.nodes.evidence_util import evidence_from_chunk
+from .graph.nodes.evidence_util import (
+    _best_title,
+    evidence_from_chunk,
+)
 from .graph.nodes.sufficiency import score_evidence as _score_evidence
 from .indexes.retriever import Retriever
 from .indexes.store import Store
@@ -261,16 +264,61 @@ def _neo4j_related(app, paper_id: str, relation: str, limit: int) -> list[dict]:
                 pass
 
 
-# ── get_paper / corpus_stats ──────────────────────────────────────────────
+# ── get_paper / get_chunk / get_references / corpus_stats ──────────────────
+def _resolve_paper(store, query: str):
+    """Resolve a user query to a PaperRecord.
+
+    Tries, in order: (1) exact paper_id; (2) case-insensitive title substring
+    against the *stored* title; (3) title substring against the *derived*
+    display title (matters when the stored title is just a filename stem);
+    (4) paper_id prefix. Most-chunked match wins ties. Returns None if no
+    match."""
+    p = store.get_paper(query)
+    if p is not None:
+        return p
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    papers = store.list_papers()
+
+    def _match(keyfn) -> list:
+        return [p for p in papers if keyfn(p)]
+
+    matches = _match(lambda p: q in (p.title or "").lower())
+    if not matches:
+        # Stored title is often a weak stem; try the derived display title.
+        matches = _match(
+            lambda p: bool(_best_title(p, store))
+            and q in _best_title(p, store).lower()
+        )
+    if not matches:
+        matches = _match(lambda p: (p.paper_id or "").lower().startswith(q))
+    if not matches:
+        return None
+    matches.sort(key=lambda p: store.count_chunks_for_paper(p.paper_id), reverse=True)
+    return matches[0]
+
+
 def get_paper(paper_id: str, *, app: AppContext | None = None) -> dict | None:
+    """Full metadata for a corpus paper.
+
+    `paper_id` may be an exact store id OR a title substring (most-chunked
+    match wins). The `title` field is the *derived* display title (a real
+    paper title when the stored one is just a filename stem), and a parsed
+    `references` list (split into individual entries) is included so a client
+    can read the full bibliography in one call — not by fishing through
+    truncated `search_corpus` chunks.
+    """
     app = app or get_app()
-    p = app.store.get_paper(paper_id)
+    p = _resolve_paper(app.store, paper_id)
     if p is None:
         return None
-    chunks = app.store.chunks_for_paper(paper_id)
+    chunks = app.store.chunks_for_paper(p.paper_id)
+    title = _best_title(p, app.store) or p.title or p.path
     return {
         "paper_id": p.paper_id,
-        "title": p.title,
+        "title": title,
+        "stored_title": p.title,
         "year": p.year,
         "doi": p.doi,
         "authors": p.authors,
@@ -284,7 +332,163 @@ def get_paper(paper_id: str, *, app: AppContext | None = None) -> dict | None:
             for c in chunks
         ],
         "n_chunks": len(chunks),
+        "references": get_references(p.paper_id, app=app),
     }
+
+
+def get_chunk(chunk_id: str, *, app: AppContext | None = None) -> dict | None:
+    """The FULL, untruncated text of one chunk plus its provenance.
+
+    This is the "give me chunk c7" primitive: use it to read an exact passage
+    (e.g. a table row or a definition) that `search_corpus` only returned
+    truncated. Returns the chunk's text, its paper/section/page, and a slice
+    of neighbouring chunks (by ordinal) for local context. Read-only, ~10ms.
+    """
+    app = app or get_app()
+    rec = app.store.get_chunk(chunk_id)
+    if rec is None:
+        return None
+    paper = app.store.get_paper(rec.paper_id)
+    siblings = app.store.chunks_for_paper(rec.paper_id)
+    try:
+        idx = next(i for i, c in enumerate(siblings) if c.chunk_id == chunk_id)
+    except StopIteration:
+        idx = 0
+    window = siblings[max(0, idx - 1): idx + 2]
+    return {
+        "chunk_id": chunk_id,
+        "paper_id": rec.paper_id,
+        "paper": (_best_title(paper, app.store) if paper else ""),
+        "year": paper.year if paper else None,
+        "doi": paper.doi if paper else None,
+        "section": rec.heading,
+        "page": rec.page,
+        "ordinal": rec.ordinal,
+        "tokens": rec.tokens,
+        "text": rec.text,  # full text — NOT truncated
+        "context": [
+            {"chunk_id": c.chunk_id, "section": c.heading,
+             "page": c.page, "ordinal": c.ordinal,
+             "text": (c.text or "")[:app.cfg.mcp.max_chunk_chars]}
+            for c in window if c.chunk_id != chunk_id
+        ],
+    }
+
+
+def get_sections(paper_id: str, *, app: AppContext | None = None) -> list[dict]:
+    """A paper's sections (hierarchical spans) in document order.
+
+    Each section lists the chunk ids that make it up plus first/last flags,
+    so a client can navigate coarse-to-fine: read the section list, then pull
+    a single untruncated section with :func:`get_section`. Works whether or not
+    the chunks carry explicit ``section_id`` meta (falls back to grouping by
+    heading + ordinal). Read-only, ~10ms.
+    """
+    app = app or get_app()
+    p = _resolve_paper(app.store, paper_id)
+    if p is None:
+        return []
+    chunks = app.store.chunks_for_paper(p.paper_id)
+    sections: list[dict] = []
+    seen: dict[str, dict] = {}
+    for c in chunks:
+        meta = c.meta or {}
+        sid = meta.get("section_id")
+        heading = meta.get("section_heading") or c.heading or ""
+        if sid:
+            key = sid
+        else:
+            # No explicit section id: group by (heading or "P<page>") so we
+            # still produce a sensible coarse outline.
+            key = f"__h__{heading or ('P' + str(c.page if c.page is not None else '?'))}"
+        if key not in seen:
+            entry = {
+                "section_id": sid or key,
+                "heading": heading,
+                "chunk_ids": [],
+                "first_chunk": c.chunk_id,
+                "last_chunk": c.chunk_id,
+                "n_chunks": 0,
+                "page": c.page,
+                "tokens": 0,
+            }
+            seen[key] = entry
+            sections.append(entry)
+        entry = seen[key]
+        entry["chunk_ids"].append(c.chunk_id)
+        entry["last_chunk"] = c.chunk_id
+        entry["n_chunks"] += 1
+        entry["tokens"] += c.tokens or 0
+        if c.page is not None and (entry["page"] is None or c.page < entry["page"]):
+            entry["page"] = c.page
+    return sections
+
+
+def get_section(
+    paper_id: str, section_id: str, *, app: AppContext | None = None
+) -> dict | None:
+    """One section as a single untruncated unit (all its chunks stitched).
+
+    The hierarchical counterpart of :func:`get_chunk`. Use it to read an
+    entire section (e.g. the full "Method" or "References") in document order
+    without per-chunk truncation, and to see which chunks make it up.
+    ``section_id`` may be the exact id from :func:`get_sections` or a heading
+    substring. Returns ``None`` if the section can't be found.
+    """
+    app = app or get_app()
+    p = _resolve_paper(app.store, paper_id)
+    if p is None:
+        return None
+    sections = get_sections(p.paper_id, app=app)
+    if not sections:
+        return None
+
+    def _find(sections: list[dict], q: str) -> dict | None:
+        q = (q or "").strip()
+        for s in sections:
+            if s["section_id"] == q:
+                return s
+        ql = q.lower()
+        for s in sections:
+            if ql and ql in (s["heading"] or "").lower():
+                return s
+        return None
+
+    sec = _find(sections, section_id)
+    if sec is None:
+        return None
+    chunks = app.store.chunks_for_paper(p.paper_id)
+    by_id = {c.chunk_id: c for c in chunks}
+    parts = [by_id[cid] for cid in sec["chunk_ids"] if cid in by_id]
+    text = "\n\n".join(c.text for c in parts)
+    return {
+        "paper_id": p.paper_id,
+        "paper": _best_title(p, app.store),
+        "section_id": sec["section_id"],
+        "heading": sec["heading"],
+        "page": sec["page"],
+        "n_chunks": sec["n_chunks"],
+        "tokens": sec["tokens"],
+        "chunk_ids": sec["chunk_ids"],
+        "first_chunk": sec["first_chunk"],
+        "last_chunk": sec["last_chunk"],
+        "text": text,  # full, untruncated section text in document order
+    }
+
+
+def get_references(paper_id: str, *, app: AppContext | None = None) -> list[str]:
+    """The paper's reference list as individual, untruncated entries.
+
+    Pulls the References/Bibliography section (or the final chunks when no
+    heading matches), joins them in document order, and splits into per-entry
+    strings (markers like [1], 2. are preserved so the index is recoverable).
+    Returns ``[]`` when no reference section is found. Read-only, ~10ms.
+    """
+    app = app or get_app()
+    from .review import references_text, split_references
+
+    chunks = app.store.chunks_for_paper(paper_id)
+    return split_references(references_text(chunks))
 
 
 def corpus_stats(app: AppContext | None = None) -> dict:

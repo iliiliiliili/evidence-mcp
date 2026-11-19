@@ -18,21 +18,80 @@ from typing import Any
 
 from ..state import EvidenceState
 from .context import get_context
+from .evidence_util import group_from_path
 
 logger = logging.getLogger(__name__)
 
 
 # ── shared formatting helpers ─────────────────────────────────────────────
+def _corpus_tree(ctx, max_papers_per_group: int = 12) -> str:
+    """Render the FULL corpus as a tree of groups → papers, from the store.
+
+    A paper's *group* is the immediate parent folder of its on-disk path
+    (see `evidence_util.group_from_path`); papers in the same folder form a
+    group. External (OpenAlex/S2/Crossref) works are tagged `external`.
+
+    This is injected into the planner and writer prompts so the model has
+    always-visible awareness of what's in the corpus, and can use that
+    structure when a question calls for it (e.g. "compare group A with
+    group B", "summarise the finance papers") — without the user having to
+    pass `--group` explicitly. The structure is informational: it does NOT
+    filter the evidence set. The user can still hard-restrict via the
+    `allowed_groups` state field (`evidence ask --group …`).
+
+    Cap the per-group listing to keep the prompt compact; large corpora
+    just lose some tail papers from the listing (they're still in the
+    evidence set if retrieved).
+    """
+    try:
+        papers = ctx.store.list_papers()
+    except Exception as exc:  # noqa: BLE001 - never let a bad store kill a query
+        logger.warning("corpus_tree: store unavailable: %s", exc)
+        return ""
+    if not papers:
+        return ""
+
+    by_group: dict[str, list] = {}
+    for p in papers:
+        grp = group_from_path(p.path) or "(root)"
+        by_group.setdefault(grp, []).append(p)
+
+    lines: list[str] = ["corpus tree (groups → papers):"]
+    for grp in sorted(by_group, key=lambda g: g.lower()):
+        plist = by_group[grp]
+        extra = len(plist) - max_papers_per_group
+        suffix = f"  (+{extra} more)" if extra > 0 else ""
+        lines.append(f"  group [{grp}]  ({len(plist)} paper(s)){suffix}")
+        for p in plist[:max_papers_per_group]:
+            title = (p.title or p.path)[:80]
+            path = p.path if p.path else ""
+            doi = f"  doi={p.doi}" if p.doi else ""
+            lines.append(f"    - {title}  {path}{doi}".rstrip())
+    return "\n".join(lines)
+
+
 def _fmt_evidence_block(evidence: list[dict], max_items: int = 12) -> str:
+    """Render the evidence list for the planner/researcher/writer prompts.
+
+    Each item shows its [E#] index, source path, relevance, paper title, and
+    — when a group is set — the group label. The group is the paper's
+    immediate parent folder name (see `evidence_util.group_from_path`).
+    Group-aware prompting lets the model *contrast* groups for comparative
+    questions ("what does group A conclude, and how does group B change it?").
+    """
     lines = []
     for i, ev in enumerate(evidence[:max_items], start=1):
-        title = ev.get("title", "")[:90]
+        title = (ev.get("title") or "")[:90]
         src = ev.get("source", "?")
         rel = ev.get("relevance", 0.0)
+        grp = ev.get("group") or ""
         text = (ev.get("text") or "").strip().replace("\n", " ")
         if len(text) > 320:
             text = text[:320] + "…"
-        lines.append(f"[E{i}] (src={src}, rel={rel:.2f}) {title}\n    {text}")
+        group_part = f" group={grp}" if grp else ""
+        lines.append(
+            f"[E{i}] (src={src}, rel={rel:.2f}{group_part}) {title}\n    {text}"
+        )
     return "\n".join(lines) or "(no evidence)"
 
 
@@ -44,7 +103,13 @@ _PLANNER_SYSTEM = (
     "\"must_cover\": [str, ...], \"evidence_refs\": [int, ...]}]}. "
     "Each section's evidence_refs point to [E#] items that should back it. "
     "Keep to 3-6 sections. Do not invent facts; only plan what the evidence "
-    "can support."
+    "can support.\n\n"
+    "Evidence items may carry a `group` label (the folder the paper was "
+    "ingested from). When the question is comparative — e.g. asks how a "
+    "conclusion changes across groups, or asks to weigh one group against "
+    "another — plan sections that cover EACH relevant group separately and "
+    "include a synthesis section that explicitly contrasts them, attributing "
+    "each claim to its group's evidence."
 )
 
 
@@ -76,10 +141,15 @@ def plan(state: EvidenceState) -> dict:
     question = state.get("question", "")
     intent = state.get("intent", "content")
 
+    # Corpus structure (groups → papers). Always shown so the planner can
+    # reference it when the question calls for it; harmless for others.
+    tree = _corpus_tree(ctx)
+
     data = ctx.models.complete_json(
         prompt=(
             f"Intent: {intent}\nQuestion: {question}\n\n"
-            f"Evidence:\n{_fmt_evidence_block(evidence)}\n\n"
+            + (f"{tree}\n\n" if tree else "")
+            + f"Evidence:\n{_fmt_evidence_block(evidence)}\n\n"
             "Produce the outline."
         ),
         model=ctx.cfg.ollama.reasoning,

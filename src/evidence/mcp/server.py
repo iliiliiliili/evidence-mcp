@@ -89,10 +89,81 @@ def create_server(name: str = "evidence"):
 
     @mcp.tool()
     def get_paper(paper_id: str) -> dict:
-        """Full metadata for a corpus paper: title, year, authors, abstract,
-        section outline, reference list, and chunk count. Use to expand a
-        citation from `search_corpus` into a full reference. Read-only, ~10ms."""
+        """Full metadata for a corpus paper: derived title, year, authors,
+        abstract, section outline, chunk count, AND the parsed reference list
+        (split into individual entries). `paper_id` may be an exact id or a
+        title substring. Use this — not `search_corpus` — to read a paper's
+        bibliography in one clean, untruncated call. Read-only, ~10ms."""
         return tools.get_paper(paper_id)
+
+    @mcp.tool()
+    def get_chunk(chunk_id: str) -> dict:
+        """The FULL, untruncated text of one chunk plus its provenance
+        (paper, section, page) and neighbouring chunks for context. Use this
+        "give me chunk X" call to read an exact passage — a table row, a
+        definition, a reference entry — that `search_corpus` returned
+        truncated. Read-only, ~10ms."""
+        return tools.get_chunk(chunk_id)
+
+    @mcp.tool()
+    def get_references(paper_id: str) -> list[str]:
+        """The paper's reference list as individual, untruncated entries
+        (numbering preserved). The clean, structured way to read a bibliography
+        — preferred over fishing through truncated `search_corpus` chunks.
+        `paper_id` may be an exact id or a title substring. Read-only, ~10ms."""
+        return tools.get_references(paper_id)
+
+    # ── Hierarchical navigation (sections + chunk graph) ──────────────────
+    @mcp.tool()
+    def get_sections(paper_id: str) -> list[dict]:
+        """A paper's sections (hierarchical spans) in document order — a
+        coarse-to-fine navigation outline. Each entry lists its `chunk_ids`,
+        first/last chunk, heading, page, and token count. Use this to plan a
+        read, then pull one whole section with `get_section`. Read-only, ~10ms."""
+        return tools.get_sections(paper_id)
+
+    @mcp.tool()
+    def get_section(paper_id: str, section_id: str) -> dict:
+        """ONE section as a single untruncated unit (all its chunks stitched in
+        document order). The hierarchical counterpart of `get_chunk` — use it
+        to read a whole section (Method, Results, References, …) cleanly.
+        `section_id` may be the exact id from `get_sections` or a heading
+        substring (e.g. 'Method', 'Results'). Read-only, ~10ms."""
+        return tools.get_section(paper_id, section_id)
+
+    @mcp.tool()
+    def build_chunk_links(
+        paper_id: str | None = None, reset: bool = True
+    ) -> dict:
+        """(Re)build the chunk-graph over the corpus (or one paper). Always emits
+        deterministic links (adjacent 'continuation', same-section 'see_also')
+        and, when a local reasoning model is available, adds semantic LLM links
+        (see_also / depends_on / cites / contrasts / example) with a short
+        reason and confidence. Fail-soft: a model error just yields fewer
+        links, never a failure. Pass `paper_id` to scope it; `reset=False` to
+        append. Returns a build report (counts + skipped papers)."""
+        return tools.build_chunk_links(paper_id=paper_id, reset=reset)
+
+    @mcp.tool()
+    def linked_chunks(
+        chunk_id: str, direction: str = "both", min_confidence: float = 0.0
+    ) -> dict:
+        """Neighbour chunks of `chunk_id` with the relation + reason of each
+        link. direction: 'out' (where this chunk points), 'in' (what points to
+        it), or 'both'. Each neighbour carries a text preview so you can follow
+        the edge inline. Navigation over the chunk graph built by
+        `build_chunk_links`. Read-only, ~10ms."""
+        return tools.linked_chunks(
+            chunk_id, direction=direction, min_confidence=min_confidence
+        )
+
+    @mcp.tool()
+    def links_for_paper(paper_id: str, min_confidence: float = 0.0) -> dict:
+        """All chunk-links whose source chunk belongs to `paper_id`, in
+        confidence order, each with short previews of both endpoints. Includes
+        cross-paper edges (e.g. a 'cites' link into another paper) so you can
+        follow a citation across papers. Read-only, ~10ms."""
+        return tools.links_for_paper(paper_id, min_confidence=min_confidence)
 
     # ── External literature (stage 9) ─────────────────────────────────────
     @mcp.tool()
@@ -104,7 +175,12 @@ def create_server(name: str = "evidence"):
         open-access PDF URL when available. intent: content | bibliometric →
         most-cited; trend → year order; current_world → newest first. Use for
         recent work the corpus may not contain. Network: ~1s (polite-pool
-        rate-limited)."""
+        rate-limited).
+
+        Identifier fast-path: if the query contains a DOI (`10.xxxx/...`) or an
+        arXiv id (`arXiv:2510.05710`), it is resolved DIRECTLY to that work
+        instead of a fuzzy keyword search — the reliable way to verify a
+        specific prior paper that a keyword search would return as noise."""
         return tools.search_literature(
             query, intent=intent, limit=limit, cfg=facade.get_app().cfg
         )
@@ -151,6 +227,37 @@ def create_server(name: str = "evidence"):
         For quick lookups prefer `search_corpus`; use this for open research
         questions."""
         return tools.answer_research(question)
+
+    @mcp.tool()
+    def review_paper(
+        paper_id: str,
+        external: bool | None = None,
+        resolve_limit: int = 25,
+    ) -> dict:
+        """Produce a structured scientific (peer) review of ONE paper in the
+        local corpus.
+
+        Returns a fixed five-part structure:
+          1. `summary` — problem, contribution, method, headline result.
+          2. `strengths` / `weaknesses`.
+          3. `incorrect_statements` — candidate factual errors / contradictions /
+             misused methods, each with a `confidence` (high|medium|low) and a
+             `chunk_id`. These are things to CHECK, not confirmed errors.
+          4. `undefined_terms` — terms/acronyms used without a definition.
+          5. `references` — the paper's reference list, each with a `relevance`
+             (high|medium|low) and a `role` (method|comparison|dataset|…), plus
+             a `resolved` block when `external` is enabled (was the work found
+             in OpenAlex/S2/Crossref?).
+
+        `paper_id` may be an exact id or a title substring. `external` overrides
+        the config's external-search setting for reference lookups (None = follow
+        config). `resolve_limit` caps how many references are checked externally
+        (high relevance first). Read-only — never mutates the corpus or ledger.
+        Cost: two local model calls + optional network; a deterministic fallback
+        keeps it working with no local model."""
+        return tools.review_paper(
+            paper_id, external=external, resolve_limit=resolve_limit
+        )
 
     # ── Evidence ledger (cache-first layer) ───────────────────────────────
     @mcp.tool()

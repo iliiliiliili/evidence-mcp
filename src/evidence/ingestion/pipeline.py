@@ -107,7 +107,16 @@ def ingest_corpus(
         for idx, ch in enumerate(chunks):
             ch.paper_id = paper_id
             ch.chunk_id = f"{paper_id}#c{idx}"
-            ch.meta = {"heading": ch.heading}
+            # Hierarchical span metadata: which section this chunk belongs to
+            # and where it sits within that section (first/last flags let
+            # `get_section` stitch a span back together without truncation).
+            ch.meta = {
+                "heading": ch.heading,
+                "section_id": ch.section_id,
+                "section_heading": ch.heading,
+                "is_first_in_section": ch.is_first_in_section,
+                "is_last_in_section": ch.is_last_in_section,
+            }
             record = ChunkRecord(
                 chunk_id=ch.chunk_id,
                 paper_id=paper_id,
