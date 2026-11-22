@@ -18,6 +18,12 @@ Commands:
   evidence section <p> <sec> Read one section as a single untruncated unit.
   evidence build-links [p]   Build the chunk-graph (deterministic + LLM links).
   evidence links <chunk|p>   Show the chunk-graph around a chunk or a paper.
+  evidence hosts [name]      List configured hosts, types, and per-role routing.
+  evidence hosts-add <n> <url>   Add/replace a host (--type ollama|openai).
+  evidence hosts-use <n>       Make a host the default for ALL roles.
+  evidence hosts-route <r> <n> Route one role (reasoning/light/embed) to a host.
+Global flag: --host/-H <name|url>  Select an Ollama host when several are defined
+  (task commands print the host they use when more than one is configured).
 """
 
 from __future__ import annotations
@@ -49,6 +55,29 @@ app = typer.Typer(
 console = Console()
 err_console = Console(stderr=True)
 
+# Set by the global `--host` callback (see below) before any command runs.
+_ACTIVE_HOST_OVERRIDE: str | None = None
+
+
+@app.callback(invoke_without_command=True)
+def _main(
+    host: str | None = typer.Option(
+        None,
+        "--host",
+        "-H",
+        help=(
+            "Select an Ollama host by NAME (as defined in config `ollama.hosts`), "
+            "or pass a full URL (e.g. http://10.0.0.5:6006) to use an ad-hoc host "
+            "for this invocation. Ignored when only a single host is configured."
+        ),
+        show_default=False,
+    ),
+) -> None:
+    """Register the global `--host`/`-H` option (sets the active host override)."""
+    global _ACTIVE_HOST_OVERRIDE
+    if host:
+        _ACTIVE_HOST_OVERRIDE = host
+
 
 def _stdin_is_tty() -> bool:
     """True when stdin is an interactive terminal (safe to prompt)."""
@@ -69,7 +98,69 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _load_config(path: str | None) -> EvidenceConfig:
-    return EvidenceConfig.load(path)
+    cfg = EvidenceConfig.load(path)
+    _apply_host_override(cfg)
+    return cfg
+
+
+def _apply_host_override(cfg: EvidenceConfig) -> EvidenceConfig:
+    """Apply the global `--host`/`-H` selection to `cfg` (in place) and show a
+    banner when more than one host is defined. Returns `cfg` unchanged."""
+    override = _ACTIVE_HOST_OVERRIDE
+    if override:
+        if override in cfg.ollama.hosts:
+            cfg.ollama.active_host = override
+        elif override.startswith(("http://", "https://")):
+            # Ad-hoc host not in the config: use it for this run only.
+            cfg.ollama.active_host = "__adhoc__"
+            cfg.ollama.hosts.setdefault("__adhoc__", override)
+        else:
+            # Treat it as a name even without a scheme; if unknown, fall back
+            # to the first defined host (the banner below will show what's used).
+            if override in cfg.ollama.hosts:
+                cfg.ollama.active_host = override
+    _print_host_banner(cfg)
+    return cfg
+
+
+def _print_host_banner(cfg: EvidenceConfig) -> None:
+    """When MORE THAN ONE host is defined, show which one this task will use.
+
+    Silent for the common single-host setup so existing output is unchanged.
+    An ad-hoc `--host <url>` override is always surfaced (it's the only host).
+    """
+    ol = cfg.ollama
+    names = [n for n in ol.host_names() if n != "__adhoc__"]
+    if ol.active_host == "__adhoc__":
+        err_console.print(
+            f"[dim]ollama host:[/dim] [cyan]{ol.active_host_url()}[/cyan] (ad-hoc)"
+        )
+        return
+    if len(names) <= 1:
+        return  # single (or no) named host — nothing to disambiguate
+    active = ol.active_host_url()
+    label = ol.active_host or names[0]
+    err_console.print(
+        f"[dim]ollama host:[/dim] [cyan]{label}[/cyan] → {active}"
+        f"  [dim](of {len(names)} defined: {', '.join(names)})[/dim]"
+    )
+
+
+def _print_hosts_status(cfg: EvidenceConfig) -> None:
+    """Show the configured Ollama host(s) in `status` output."""
+    ol = cfg.ollama
+    names = ol.host_names()
+    if not names:
+        console.print(f"[bold]ollama host:[/bold] {ol.host}")
+        return
+    active_name = ol.active_host or names[0]
+    if ol.active_host == "__adhoc__":
+        active_name = "adhoc"
+    parts = ", ".join(f"{n} ({ol.hosts[n]})" for n in names)
+    console.print(
+        f"[bold]ollama hosts:[/bold] {len(names)} defined — {parts}  "
+        f"[dim](active: {active_name} → {ol.active_host_url()})[/dim]"
+    )
 
 
 def _build_app(cfg: EvidenceConfig):
@@ -87,6 +178,25 @@ CONFIG_TEMPLATE = """\
 # ── Local models (Ollama) ────────────────────────────────────────────────
 ollama:
   host: http://localhost:11434
+  # Multiple hosts (name → URL). When one or more are defined, these take
+  # precedence over the single `host` above; pick the active one with
+  # `active_host` or the CLI `--host <name>`. Add hosts via
+  # `evidence hosts-add <name> <url>`.
+  # hosts:
+  #   gpu-a: http://10.0.0.5:6006        # type: ollama (default)
+  #   llama: http://10.0.0.9:8080        # type: openai (llama-server / vLLM / …)
+  # active_host: gpu-a                   # the default host for ALL roles
+  # Per-host provider type: "ollama" (default) or "openai" (any OpenAI-compatible
+  # server — llama-server, vLLM, LM Studio, a hosted OpenAI endpoint).
+  # host_types:
+  #   llama: openai
+  # Optional API key per host (or set EVIDENCE_APIKEY_<NAME>).
+  # api_keys:
+  #   llama: sk-...
+  # Route a specific role to a different host (reasoning / light / embed).
+  # Un-routed roles use `active_host`. E.g. embeddings on a dedicated box:
+  # host_by_role:
+  #   embed: llama
   reasoning: qwen2.5:9b
   light: qwen2.5:4b
   embed: bge-m3
@@ -588,8 +698,22 @@ def ingest(
     ),
     config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    no_links: bool = typer.Option(
+        False,
+        "--no-links",
+        help=(
+            "Skip the chunk-graph (link) pass. By default, ingest runs "
+            "deterministic + LLM links after the index is built."
+        ),
+    ),
 ):
-    """Extract, chunk, and index a corpus directory (recursive)."""
+    """Extract, chunk, and index a corpus, then build the chunk-graph.
+
+    Two phases, in order:
+      1. **Ingest** — parse, chunk, embed, index (BM25 + FAISS).
+      2. **Links** — deterministic links always; LLM semantic links when a
+         local reasoning model is reachable. Skip with `--no-links`.
+    """
     _setup_logging(verbose)
     cfg = _load_config(config)
     corpus = (corpus or cfg.corpus_dir or Path.cwd() / "corpus").expanduser()
@@ -602,21 +726,61 @@ def ingest(
     models = Models(cfg)
     store = Store(cfg.resolved_store_path)
     try:
+        # ── Phase 1: ingest (parse + chunk + embed + index) ────────────────
         stats = ingest_corpus(corpus, cfg=cfg, models=models, store=store)
+        table = Table(title="Ingestion summary")
+        table.add_column("papers", justify="right")
+        table.add_column("chunks", justify="right")
+        table.add_column("failed", justify="right")
+        table.add_row(str(stats.papers), str(stats.chunks), str(len(stats.failed)))
+        console.print(table)
+        if stats.failed:
+            for f in stats.failed:
+                err_console.print(f"  [yellow]skipped:[/yellow] {f}")
+
+        if no_links:
+            console.print(
+                "[green]done.[/green] [dim](chunk-graph skipped via --no-links; "
+                "build later with `evidence build-links`)[/dim]"
+            )
+            return
+
+        # ── Phase 2: chunk-graph (deterministic + LLM links) ──────────────
+        link_model = cfg.ollama.reasoning
+        console.print(
+            f"\n[bold]Building chunk-graph[/bold] [dim](deterministic + LLM links)[/dim]\n"
+            f"  [dim]model:[/dim] [cyan]{link_model}[/cyan]   "
+            f"[dim]step:[/dim] [cyan]links[/cyan]   "
+            f"[dim]scope:[/dim] all {stats.papers} paper(s)"
+        )
+        from .links import build_chunk_links
+
+        try:
+            report = build_chunk_links(store, models=models, cfg=cfg, reset=True)
+        except Exception as exc:  # noqa: BLE001 - link pass must not fail ingest
+            logging.getLogger(__name__).warning("chunk-graph build failed: %s", exc)
+            err_console.print(f"[yellow]chunk-graph build failed:[/yellow] {exc}")
+            return
+
+        s = report.summary()
+        panel = Panel(
+            f"papers: [bold]{s['papers_processed']}[/bold]   "
+            f"links emitted: [bold]{s['links_emitted']}[/bold] "
+            f"(deterministic {s['deterministic_links']}, LLM {s['llm_links']})\n"
+            f"total links in store: [bold]{store.count_chunk_links()}[/bold]",
+            title="chunk-graph build",
+            border_style="green" if s["papers_processed"] else "yellow",
+            expand=False,
+        )
+        console.print(panel)
+        if s.get("skipped"):
+            console.print(f"[yellow]skipped:[/yellow] {', '.join(s['skipped'])}")
+        console.print("[green]done.[/green]")
     except Exception as exc:  # noqa: BLE001
         err_console.print(f"[red]ingestion failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-
-    table = Table(title="Ingestion summary")
-    table.add_column("papers", justify="right")
-    table.add_column("chunks", justify="right")
-    table.add_column("failed", justify="right")
-    table.add_row(str(stats.papers), str(stats.chunks), str(len(stats.failed)))
-    console.print(table)
-    if stats.failed:
-        for f in stats.failed:
-            err_console.print(f"  [yellow]skipped:[/yellow] {f}")
-    console.print("[green]done.[/green]")
+    finally:
+        store.close()
 
 
 # ── ask ───────────────────────────────────────────────────────────────────
@@ -1737,6 +1901,23 @@ def _print_review(report) -> None:
     else:
         console.print("  [dim]No references identified.[/dim]")
 
+    # 7. author overlap / conflict of interest
+    console.print("\n[bold cyan]7 · Author overlap / conflict of interest[/bold cyan]")
+    if report.author_conflicts:
+        for c in report.author_conflicts:
+            ref = c.get("ref_index") or c.get("ref_title") or "—"
+            ov = ", ".join(c.get("overlapping_authors") or []) or "—"
+            kind = c.get("kind", "")
+            style = "red" if kind == "self-citation" else "yellow"
+            console.print(
+                f"  [{style}]{kind}[/] [bold]{ref}[/bold]  [dim]→ {ov}[/dim]"
+            )
+        console.print(
+            "  [dim]Same-group / self-citation flags — check each against the paper.[/dim]"
+        )
+    else:
+        console.print("  [dim]No same-author overlaps detected.[/dim]")
+
     if report.notes:
         console.print("\n[dim]── notes ──[/dim]")
         for n in report.notes:
@@ -1744,6 +1925,249 @@ def _print_review(report) -> None:
     console.print(
         "\n[dim]Tip: write this review to a file → "
         "[bold]evidence review <paper> -o review.md[/bold][/dim]"
+    )
+
+
+# ── hosts (list / select Ollama hosts) ─────────────────────────────────────
+@app.command("hosts")
+def hosts(
+    name: str | None = typer.Argument(
+        None, help="Optional host NAME to echo the resolved selection for."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="YAML config file."),
+):
+    """List the configured Ollama hosts, or set which one is active.
+
+    Named hosts live in the config under `ollama.hosts` (a name → URL map).
+    This command is read-only: it shows what's defined and which one will be
+    used (respecting `--host`). To change the default, edit the YAML or pass
+    `--host <name>` on the task command.
+
+    \b
+    Examples:
+      evidence hosts                    # list hosts + the active one
+      evidence hosts --host gpu-a       # show selection with a named host
+      evidence hosts http://10.0.0.5:6006   # resolve an ad-hoc URL
+    """
+    cfg = _load_config(config)
+    ol = cfg.ollama
+    names = ol.host_names()
+    if not names:
+        console.print(
+            f"No named hosts defined. Using single host: [cyan]{ol.host}[/cyan]\n"
+            f"  [dim]Add hosts with `evidence hosts-add <name> <url>`; enable "
+            f"multi-host selection by defining `ollama.hosts:`.[/dim]"
+        )
+        raise typer.Exit(code=0)
+    # Map host → the role(s) explicitly routed to it (for the display column).
+    routed: dict[str, list[str]] = {n: [] for n in names}
+    for role, host in ol.host_by_role.items():
+        if host in routed:
+            routed[host].append(role)
+    active_name = ol.active_host or names[0]
+    if ol.active_host == "__adhoc__":
+        active_name = "adhoc"
+    table = Table(title=f"Ollama hosts ({len(names)} defined)", show_lines=False)
+    table.add_column("name", style="cyan")
+    table.add_column("type")
+    table.add_column("url")
+    table.add_column("default", justify="center")
+    table.add_column("roles routed here")
+    for n in names:
+        mark = "[bold green]●[/bold green]" if n == active_name else ""
+        roles = ", ".join(routed[n]) or "—"
+        table.add_row(n, ol.host_type(n), ol.hosts[n], mark, roles)
+    if ol.active_host == "__adhoc__":
+        table.add_row(
+            "adhoc", "ollama", ol.active_host_url(), "[bold green]●[/bold green]", "—"
+        )
+    console.print(table)
+    # Show the per-role resolution (default for un-routed roles).
+    console.print(
+        "\n[dim]roles → host:[/dim] "
+        + "  ".join(
+            f"[cyan]{r}[/cyan] → {ol.host_for_role(r) or '(default)'}"
+            for r in ol.ROLES
+        )
+    )
+    # Optional: accept a name argument to echo the resolved selection clearly.
+    if name:
+        console.print(
+            f"\nselected host: [cyan]{name}[/cyan] → {ol.active_host_url()}"
+        )
+
+
+_HOST_TYPES = ["ollama", "openai"]
+
+
+def _save_host_or_exit(
+    name: str,
+    url: str | None,
+    config: str | None,
+    *,
+    activate: bool,
+    host_type: str | None,
+    api_key: str | None,
+    route_role: str | None,
+) -> None:
+    """Shared body for hosts-add / hosts-use / hosts-route (persist + confirm)."""
+    from .config import EvidenceConfig, save_host
+
+    cfg = EvidenceConfig.load(config)
+    ol = cfg.ollama
+
+    if name not in ol.hosts:
+        if url is None:
+            err_console.print(
+                f"[red]Host [cyan]{name}[/cyan] is not defined. "
+                f"Pass a URL: [dim]evidence hosts-add {name} <url>[/dim]"
+            )
+            raise typer.Exit(code=1)
+    try:
+        target = save_host(
+            name,
+            url or ol.hosts[name],
+            config,
+            activate=activate,
+            host_type=host_type,
+            api_key=api_key,
+        )
+        if route_role:
+            _save_role_route(name, route_role, config)
+    except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
+        err_console.print(f"[red]Could not update config:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]✓[/green] saved host [cyan]{name}[/cyan] → {url or ol.hosts[name]}")
+    if host_type:
+        console.print(f"[dim]type = {host_type}[/dim]")
+    if activate:
+        console.print(f"[dim]now the default host for ALL roles (active_host = {name})[/dim]")
+    if route_role:
+        console.print(f"[dim]role {route_role} → host {name}[/dim]")
+    console.print(f"[dim]config: {target}[/dim]")
+
+
+def _save_role_route(name: str, role: str, config: str | None) -> None:
+    """Persist `ollama.host_by_role[role] = name` into the config file."""
+    import yaml
+
+    from .config import _resolve_config_path
+
+    if role not in ("reasoning", "light", "embed"):
+        err_console.print(f"[red]Unknown role [cyan]{role}[/cyan]. "
+                          f"Use one of: reasoning, light, embed.")
+        raise typer.Exit(code=1)
+    target = _resolve_config_path(config) or (Path.cwd() / ".evidence" / "config.yaml")
+    data: dict = {}
+    if target.exists():
+        with target.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    ollama = data.setdefault("ollama", {})
+    if not isinstance(ollama, dict):
+        ollama = {}
+        data["ollama"] = ollama
+    host_by_role = ollama.get("host_by_role")
+    if not isinstance(host_by_role, dict):
+        host_by_role = {}
+        ollama["host_by_role"] = host_by_role
+    host_by_role[role] = name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+
+
+@app.command("hosts-add")
+def hosts_add(
+    name: str = typer.Argument(
+        ..., help="Host NAME to add (e.g. gpu-c). A URL is passed as the 2nd arg."
+    ),
+    url: str = typer.Argument(
+        ..., help="Host base URL (e.g. http://10.0.0.5:6006 for Ollama/llama-server)."
+    ),
+    host_type: str = typer.Option(
+        "ollama", "--type", "-t", help="Provider: 'ollama' or 'openai' (OpenAI-compatible)."
+    ),
+    api_key: str | None = typer.Option(
+        None, "--api-key", help="API key for this host (optional; 'openai' hosts may need one)."
+    ),
+    activate: bool = typer.Option(
+        False, "--activate", "-A",
+        help="Also make this the default host for ALL roles (sets `ollama.active_host`).",
+    ),
+    role: str | None = typer.Option(
+        None, "--role", "-r",
+        help="Route a specific role to this host: reasoning, light, or embed.",
+    ),
+    config: str | None = typer.Option(
+        None, "--config", "-c", help="Config file to edit (default: auto-discovered)."
+    ),
+) -> None:
+    """Add (or replace) a named host and persist it to the config file.
+
+    This is the one hosts operation that WRITES to disk — the `evidence hosts`
+    command is read-only. Register a new GPU box / node, choose its provider
+    type, and point the default (all roles) or a single role at it.
+
+    \b
+    Examples:
+      evidence hosts-add gpu-c http://10.0.0.7:6006                  # ollama
+      evidence hosts-add llama http://10.0.0.9:8080 --type openai    # llama-server/vLLM
+      evidence hosts-add gpu-a http://10.0.0.5:6006 --activate       # default for all roles
+      evidence hosts-add llama http://10.0.0.9:8080 --type openai --role embed
+      evidence hosts-add gpu-c http://10.0.0.7:6006 --api-key sk-...
+    """
+    if host_type not in _HOST_TYPES:
+        err_console.print(f"[red]--type must be one of: {', '.join(_HOST_TYPES)}")
+        raise typer.Exit(code=1)
+    _save_host_or_exit(
+        name, url, config,
+        activate=activate, host_type=host_type, api_key=api_key, route_role=role,
+    )
+
+
+@app.command("hosts-use")
+def hosts_use(
+    name: str = typer.Argument(..., help="Existing host NAME to make the default."),
+    config: str | None = typer.Option(
+        None, "--config", "-c", help="Config file to edit (default: auto-discovered)."
+    ),
+) -> None:
+    """Set the DEFAULT host (used for all roles unless a role is routed elsewhere).
+
+    Equivalent to `hosts-add <name> <anything> --activate`, but for a host that
+    is already defined. Use `hosts-route` to send a single role to another host.
+
+    \b
+    Examples:
+      evidence hosts-use gpu-a
+      evidence hosts-use gpu-a --config /path/to/config.yaml
+    """
+    _save_host_or_exit(
+        name, None, config, activate=True, host_type=None, api_key=None, route_role=None,
+    )
+
+
+@app.command("hosts-route")
+def hosts_route(
+    role: str = typer.Argument(..., help="Role to route: reasoning, light, or embed."),
+    name: str = typer.Argument(..., help="Existing host NAME to serve this role."),
+    config: str | None = typer.Option(
+        None, "--config", "-c", help="Config file to edit (default: auto-discovered)."
+    ),
+) -> None:
+    """Route ONE model role to a specific host (e.g. embeddings on a dedicated box).
+
+    Roles not routed here still use the default (`hosts-use`) host. This is the
+    "put the embedding model on a different machine" knob.
+
+    \b
+    Examples:
+      evidence hosts-route embed llama
+      evidence hosts-route reasoning gpu-a
+    """
+    _save_host_or_exit(
+        name, None, config, activate=False, host_type=None, api_key=None, route_role=role,
     )
 
 
@@ -1778,7 +2202,8 @@ def status(
         "present" if (index_dir / "bm25.pkl").exists() else "absent",
     )
     console.print(table)
-    console.print(f"\n[bold]models:[/bold] reasoning={cfg.ollama.reasoning}  "
+    _print_hosts_status(cfg)
+    console.print(f"[bold]models:[/bold] reasoning={cfg.ollama.reasoning}  "
                   f"light={cfg.ollama.light}  embed={cfg.ollama.embed}")
     console.print(f"[bold]retrieval:[/bold] candidates={cfg.retrieval.candidates}  "
                   f"keep_after_rerank={cfg.retrieval.keep_after_rerank}  "

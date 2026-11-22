@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +45,109 @@ class OllamaConfig(BaseModel):
     # next request. Ollama's default is 5m; "0" unloads immediately, "24h"/
     # "168h" keeps it resident. Use "0" only if you need the VRAM freed fast.
     keep_alive: str = Field(default="1h")
+    # Named Ollama hosts — e.g. multiple GPU boxes / nodes, or a fast and a
+    # slow box. When one or more are defined, `active_host_url()` resolves the
+    # host to use from here (the legacy single `host` is ignored). Select the
+    # active one with `active_host`, the `EVIDENCE_OLLAMA_ACTIVE_HOST` env var,
+    # or the CLI `--host <name>` flag.
+    hosts: dict[str, str] = Field(default_factory=dict)
+    # Which named host to use. None → the first defined host is the default.
+    active_host: str | None = Field(default=None)
+    # Host TYPE per named host: "ollama" (default) or "openai". An "openai" host
+    # is any OpenAI-compatible server — llama-server, vLLM, LM Studio, a hosted
+    # OpenAI endpoint, etc. — speaking `/v1/chat/completions` + `/v1/embeddings`.
+    # Only the `hosts` URL is required for "openai"; auth is optional (api_keys).
+    host_types: dict[str, str] = Field(default_factory=dict)
+    # API key per named host (for auth-requiring "openai" hosts). A key can also
+    # be supplied from the environment as `EVIDENCE_APIKEY_<NAME>` (NAME uppercased).
+    api_keys: dict[str, str] = Field(default_factory=dict)
+    # Route a model ROLE to a specific named host. Recognised roles:
+    #   reasoning — the heavy model (Planner/Writer/Critic, sufficiency, review)
+    #   light     — the small model (classify, rewrite, LLM rerank)
+    #   embed     — the embedding model (FAISS dense vectors)
+    # A role not listed here falls back to the active/default host, so `active_host`
+    # is the "host for everything" default and `host_by_role` pins individual roles
+    # elsewhere (e.g. embeddings on a box without chat models).
+    host_by_role: dict[str, str] = Field(default_factory=dict)
+
+    # The model roles used for routing (kept as a single source of truth).
+    # ClassVar so pydantic does not treat it as a model field.
+    ROLES: ClassVar[tuple[str, ...]] = ("reasoning", "light", "embed")
+
+    def host_names(self) -> list[str]:
+        """The defined host names, in definition order (stable for display)."""
+        return list(self.hosts.keys())
+
+    def host_type(self, name: str | None) -> str:
+        """Provider for a named host: `"openai"` or `"ollama"` (the default)."""
+        if not name:
+            return "ollama"
+        return "openai" if self.host_types.get(name) == "openai" else "ollama"
+
+    def active_host_name(self) -> str | None:
+        """The default (active) named host name, or None if no host is named."""
+        if not self.hosts:
+            return None
+        if self.active_host and self.active_host in self.hosts:
+            return self.active_host
+        return next(iter(self.hosts))
+
+    def active_host_url(self) -> str:
+        """Resolve the Ollama base URL to use right now.
+
+        Named `hosts` (if any) take precedence over the legacy single `host`.
+        Within the named hosts, `active_host` selects one; otherwise the first
+        defined host is used. Returns a ready-to-use base URL in both cases.
+        """
+        name = self.active_host_name()
+        if name:
+            return self.hosts[name]
+        return self.host
+
+    def host_url(self, name: str | None) -> str:
+        """Base URL for a named host, or the legacy single host when name is None."""
+        if name and name in self.hosts:
+            return self.hosts[name]
+        return self.host
+
+    def host_for_role(self, role: str | None) -> str | None:
+        """Named host that should serve `role` (reasoning/light/embed).
+
+        Prefers `host_by_role[role]`; otherwise the active/default host; otherwise
+        None (→ the legacy single `host`). An unknown or unconfigured role uses
+        the default, so a missing mapping never breaks routing.
+        """
+        if role and role in self.host_by_role:
+            chosen = self.host_by_role[role]
+            if chosen in self.hosts:
+                return chosen
+        return self.active_host_name()
+
+    def api_key_for(self, name: str | None) -> str | None:
+        """API key for a named host: config `api_keys` first, then env."""
+        if not name:
+            return None
+        key = self.api_keys.get(name)
+        if key:
+            return key
+        return os.environ.get(f"EVIDENCE_APIKEY_{name.upper()}") or None
+
+    def role_for_model(self, model: str | None) -> str:
+        """Map a model NAME to a routing role (reasoning/light/embed).
+
+        Exact match against the role's configured model wins. When a name is
+        not bound to a specific role (or `model` is None), fall back to
+        `reasoning` — the most general role — so an unknown model still resolves
+        to a host via `host_for_role("reasoning")`.
+        """
+        if model:
+            if model == self.reasoning:
+                return "reasoning"
+            if model == self.light:
+                return "light"
+            if model == self.embed:
+                return "embed"
+        return "reasoning"
 
 
 class RetrievalConfig(BaseModel):
@@ -291,7 +395,12 @@ class EvidenceConfig(BaseModel):
             }:
                 section = data.setdefault(parts[0], {})
                 field = parts[1]
-                # Try to coerce to the type expected by the model.
+                # Env overrides are best-effort scalars only. Container fields
+                # (dict/list) — e.g. the named `hosts` map — are left to the
+                # YAML file rather than a flat env string (a bare string can't
+                # express a name→URL mapping and would otherwise fail validation).
+                if _is_container_field(cls, parts[0], field):
+                    continue
                 section[field] = _coerce(value)
 
         try:
@@ -301,6 +410,29 @@ class EvidenceConfig(BaseModel):
                 f"Invalid Evidence config:\n{exc}\n"
                 "Check your YAML file / EVIDENCE_* env vars."
             ) from exc
+
+
+def _is_container_field(config_cls: type, section_name: str, field: str) -> bool:
+    """True if `field` on the named section of `config_cls` is a container.
+
+    Used to keep env overrides scalar-only: a flat env string can't express a
+    name→URL mapping like the named `hosts` map, so those stay YAML-only.
+
+    Note: in pydantic, the class attribute is a FieldInfo (not the class), so
+    we follow `model_fields[...].annotation` to reach the section model first.
+    """
+    fields = getattr(config_cls, "model_fields", {})
+    section_info = fields.get(section_name)
+    section_cls = getattr(section_info, "annotation", None) or section_info
+    section_fields = getattr(section_cls, "model_fields", {})
+    ftype = section_fields.get(field)
+    ann = getattr(ftype, "annotation", None) if ftype is not None else None
+    if ann is None:
+        return False
+    origin = getattr(ann, "__origin__", None)
+    if origin in (dict, list, set, tuple) or ann in (dict, list, set, tuple):
+        return True
+    return isinstance(ann, type) and issubclass(ann, (dict, list, set))
 
 
 # Top-level config keys that are filesystem paths (rebased when relative).
@@ -347,6 +479,84 @@ def _find_project_config() -> Path | None:
         if candidate.is_file():
             return candidate
     return None
+
+
+def _resolve_config_path(path: str | Path | None = None) -> Path | None:
+    """Resolve which config file `load()` would read, or None if none exists.
+
+    Precedence mirrors `EvidenceConfig.load`: explicit `path`, then the
+    `EVIDENCE_CONFIG` env var, then auto-discovery of `.evidence/config.yaml`
+    from CWD. Returns the path only when the file actually exists.
+    """
+    if path is None:
+        path = os.environ.get("EVIDENCE_CONFIG")
+    if path is None:
+        path = _find_project_config()
+    if path is None:
+        return None
+    p = Path(path)
+    return p if p.exists() else None
+
+
+def save_host(
+    name: str,
+    url: str,
+    path: str | Path | None = None,
+    *,
+    activate: bool = False,
+    host_type: str | None = None,
+    api_key: str | None = None,
+) -> Path:
+    """Add or replace a named host in the config file on disk.
+
+    Writes `ollama.hosts[name] = url` (and, when `activate` is true, sets
+    `ollama.active_host = name`), preserving the rest of the file. Optional
+    `host_type` ("ollama" | "openai") and `api_key` are persisted under
+    `ollama.host_types` / `ollama.api_keys` for hosts that need them. Returns
+    the config file path that was written.
+
+    The file location is resolved the same way `load()` reads it (explicit
+    `path`, `EVIDENCE_CONFIG`, then CWD auto-discovery). If no config file can
+    be found, one is created at `CWD/.evidence/config.yaml`.
+
+    Note: the YAML is round-tripped through the loader, so inline comments in
+    the config file are not preserved by this edit (values and key order are).
+    """
+    import yaml
+
+    target = _resolve_config_path(path)
+    if target is None:
+        target = Path.cwd() / ".evidence" / "config.yaml"
+
+    data: dict = {}
+    if target.exists():
+        with target.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+
+    ollama = data.setdefault("ollama", {})
+    if not isinstance(ollama, dict):
+        ollama = {}
+        data["ollama"] = ollama
+
+    def _as_map(key: str) -> dict:
+        val = ollama.get(key)
+        if not isinstance(val, dict):
+            val = {}
+            ollama[key] = val
+        return val
+
+    _as_map("hosts")[name] = url
+    if host_type:
+        _as_map("host_types")[name] = host_type
+    if api_key:
+        _as_map("api_keys")[name] = api_key
+    if activate:
+        ollama["active_host"] = name
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+    return target
 
 
 def _coerce(value: str) -> str | int | float | bool:

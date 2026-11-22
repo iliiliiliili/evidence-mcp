@@ -31,10 +31,38 @@ class _FakeOllamaClient:
     def __init__(self, **_):
         self.calls = 0
 
+    @staticmethod
+    def _prompt(kwargs) -> str:
+        messages = kwargs.get("messages") or []
+        return " ".join(m.get("content", "") for m in messages)
+
     def chat(self, **kwargs) -> dict:
         self.calls += 1
-        if self.calls == 1:
+        prompt = self._prompt(kwargs)
+        # Prompt-driven (not call-count) so isolated calls behave correctly:
+        # the reference-annotation prompt mentions "reference list".
+        if "reference list" in prompt or "annotations" in prompt:
             payload = {
+                "annotations": [
+                    {
+                        "index": 1,
+                        "title": "Foundations of Sequence Modeling",
+                        "authors": "Smith et al.",
+                        "relevance": "high",
+                        "role": "method",
+                        "notes": "Core prior method this builds on.",
+                    },
+                    {
+                        "index": 2,
+                        "title": "A Survey of Benchmarks",
+                        "authors": "Lee",
+                        "relevance": "low",
+                        "role": "comparison",
+                    },
+                ]
+            }
+            return {"message": {"content": json.dumps(payload)}}
+        payload = {
                 "summary": "Proposes a mechanism and reports an improvement on a benchmark.",
                 "strengths": ["clear method description", "reproducible setup"],
                 "weaknesses": ["small dataset", "no ablation"],
@@ -53,29 +81,6 @@ class _FakeOllamaClient:
                         "suggestion": "Define FMH on first use.",
                     }
                 ],
-            }
-        else:
-            payload = {
-                "references": [
-                    {
-                        "index": 1,
-                        "title": "Foundations of Sequence Modeling",
-                        "authors": "Smith et al.",
-                        "year": 2019,
-                        "doi": "10.1000/f",
-                        "relevance": "high",
-                        "role": "method",
-                        "notes": "Core prior method this builds on.",
-                    },
-                    {
-                        "index": 2,
-                        "title": "A Survey of Benchmarks",
-                        "authors": "Lee",
-                        "year": 2020,
-                        "relevance": "low",
-                        "role": "comparison",
-                    },
-                ]
             }
         return {"message": {"content": json.dumps(payload)}}
 
@@ -229,6 +234,72 @@ def test_review_resolves_references_when_external(store, cfg, fake_ollama, monke
     assert calls  # at least one lookup happened
 
 
+def test_resolve_flags_low_confidence_match_as_hint(store, cfg, fake_ollama, monkeypatch):
+    """A fuzzy top-cited hit that is NOT similar to the reference must be
+    reported as found: False with a `candidate` hint — never as a verified
+    identity match. This is the 'Form 10-K → GPT-4 Technical Report' class of
+    bug the user hit."""
+    import evidence.mcp.tools as tools
+
+    def _fake_search(query, limit=5, cfg=None):
+        # The provider returns an unrelated, highly-cited work.
+        return [
+            {"paper": "GPT-4 Technical Report", "year": 2023,
+             "doi": "10.0000/gpt4", "cited_by": 9999, "source": "openalex"}
+        ]
+
+    monkeypatch.setattr(tools, "search_literature", _fake_search)
+    svc = ReviewService(cfg, store=store)
+    ref = {
+        "raw": "[9] Form 10-K, annual report, U.S. Securities and Exchange Commission.",
+        "title": "Form 10-K",
+        "authors": "U.S. Securities and Exchange Commission",
+    }
+    res = svc._resolve_reference(ref, enabled=True)
+    assert res["found"] is False
+    assert "candidate" in res and res["candidate"]["title"] == "GPT-4 Technical Report"
+    assert res["match_confidence"] < 0.5
+
+
+def test_resolve_label_shows_unverified_hint_when_low_confidence():
+    from evidence.review import _resolve_label
+
+    assert _resolve_label(None) == "—"
+    assert _resolve_label({"found": None}) == "not checked"
+    assert _resolve_label({"found": False}) == "not found"
+    hint = _resolve_label(
+        {"found": False, "candidate": {"title": "OpenAI GPT-4 Technical Report"}}
+    )
+    assert "OpenAI GPT-4" in hint and "unverified" in hint
+
+
+def test_resolve_rejects_unrelated_and_keeps_confident(store, cfg, fake_ollama, monkeypatch):
+    import evidence.mcp.tools as tools
+
+    def _fake_search(query, limit=5, cfg=None):
+        return [
+            {"paper": "Totally Unrelated Survey of Vibe Coding with LLMs",
+             "year": 2025, "doi": "10.0000/vibe", "cited_by": 500, "source": "openalex"},
+            {"paper": "FinDPO: Financial Sentiment Analysis for Algorithmic Trading "
+                      "through Preference Optimization of LLMs",
+             "year": 2025, "doi": "10.1000/findpo", "cited_by": 3, "source": "s2"},
+        ]
+
+    monkeypatch.setattr(tools, "search_literature", _fake_search)
+    svc = ReviewService(cfg, store=store)
+    ref = {
+        "raw": ("[4] FinDPO: Financial Sentiment Analysis for Algorithmic "
+                "Trading through Preference Optimization of LLMs. 2025. 10.1000/findpo"),
+        "title": "FinDPO",
+        "authors": "Iacovides, Zhou, Mandic",
+    }
+    res = svc._resolve_reference(ref, enabled=True)
+    # The similar FinDPO candidate must win over the unrelated survey.
+    assert res["found"] is True
+    assert res["match_doi"] == "10.1000/findpo"
+    assert res["match_confidence"] >= 0.5
+
+
 # ── public entry point ──────────────────────────────────────────────────────
 def test_review_paper_entry_point(store, cfg, fake_ollama):
     _seed(store)
@@ -247,6 +318,73 @@ def test_review_paper_markdown_has_sections(store, cfg, fake_ollama):
     for heading in ("## 1. Summary", "## 4. Possibly incorrect statements",
                     "## 5. Undefined terms", "## 6. References"):
         assert heading in md
+
+
+# ── new: authoritative reference list (no lossy LLM enumeration) ───────────
+def test_reference_from_entry_parses_doi_year_index():
+    from evidence.review import _reference_from_entry
+    entry = "[7] FinSMART: Financial Sentiment for Trading. 2025. arXiv:2607.28127"
+    r = _reference_from_entry(entry, 7)
+    assert r["index"] == 7
+    assert r["year"] == 2025
+    assert r["doi"] is None  # no 10.x DOI in this entry
+    assert r["raw"].startswith("[7] FinSMART")
+    assert r["relevance"] == "medium"
+    assert r["role"] == "other"
+
+
+def test_reference_from_entry_parses_doi():
+    from evidence.review import _reference_from_entry
+    entry = "[13] Beyond sentiment analysis. 2026. 10.1007/s41060-026-01064-2"
+    r = _reference_from_entry(entry, 13)
+    assert r["doi"] == "10.1007/s41060-026-01064-2"
+    assert r["index"] == 13
+
+
+def test_title_similarity_high_for_subset_and_low_for_unrelated():
+    from evidence.review import _title_similarity
+    high = _title_similarity(
+        "FinSMART: Financial Sentiment Analysis for Algorithmic Trading "
+        "through Market-Aligned Reinforcement Learning",
+        "FinSMART: Financial Sentiment for Trading",
+    )
+    low = _title_similarity(
+        "Form 10-K annual report, U.S. Securities and Exchange Commission",
+        "GPT-4 Technical Report",
+    )
+    assert high >= 0.5
+    assert low < 0.5
+
+
+def test_references_never_dropped_even_if_model_annotates_few(store, cfg, fake_ollama):
+    """The deterministic list is authoritative; a model that annotates only
+    SOME references must not cause the others to disappear."""
+    _seed(store)  # 2 references in c3
+    svc = ReviewService(cfg, store=store)
+    # The fake model annotates BOTH entries (index 1 and 2). Both should appear.
+    refs = svc._references(store.get_paper("p1"), "[1] Smith. 2019. 10.1000/f\n[2] Lee. 2020.")
+    assert len(refs) == 2
+    assert refs[0]["doi"] == "10.1000/f"
+    assert refs[0]["relevance"] == "high"
+    assert refs[1]["relevance"] == "low"
+
+
+def test_references_preserved_when_model_returns_nothing(store, cfg):
+    """If the model annotation pass fails (returns None), the full list still
+    comes through with deterministic defaults and the raw text as title."""
+    _seed(store)
+    svc = ReviewService(cfg, store=store)
+
+    # Force the annotation pass to return None.
+    def _no_ann(paper, entries):
+        return None
+
+    svc._annotate_references = _no_ann
+    refs = svc._references(store.get_paper("p1"), "[1] Smith. 2019. 10.1000/f\n[2] Lee. 2020.")
+    assert len(refs) == 2
+    assert refs[0]["relevance"] == "medium"
+    assert refs[0]["title"]  # filled from raw
+    assert "Smith" in refs[0]["title"]
 
 
 # ── reference-list splitting (the "check the references" fix) ───────────────
@@ -362,3 +500,79 @@ def test_search_literature_fast_path_resolves_doi_directly(cfg, monkeypatch):
     assert out[0]["paper"] == "The Right Paper"
     assert out[0]["match"] == "identifier"
     assert out[0]["resolved_via"] == "10.1000/f"
+
+
+# ── author-overlap / conflict-of-interest (deterministic, no model) ─────────
+def test_find_author_conflicts_flags_self_citation():
+    from evidence.review import find_author_conflicts
+    paper_authors = ["Alice Smith", "Bob Jones"]
+    refs = [
+        {"index": 1, "title": "Prior work", "authors": "A. Smith and B. Jones"},
+        {"index": 2, "title": "Unrelated", "authors": "Zoe Q. Unrelated"},
+    ]
+    conflicts = find_author_conflicts(paper_authors, refs)
+    assert len(conflicts) == 1
+    assert conflicts[0]["ref_index"] == 1
+    assert conflicts[0]["kind"] == "self-citation"  # both authors matched
+    assert set(conflicts[0]["overlapping_authors"]) == {"Alice Smith", "Bob Jones"}
+
+
+def test_find_author_conflicts_partial_overlap():
+    from evidence.review import find_author_conflicts
+    paper_authors = ["Alice Smith", "Bob Jones"]
+    refs = [
+        {"index": 5, "title": "One author shared", "authors": "Alice Smith and C. Other"},
+    ]
+    conflicts = find_author_conflicts(paper_authors, refs)
+    assert len(conflicts) == 1
+    assert conflicts[0]["kind"] == "author-overlap"  # only one matched
+    assert conflicts[0]["overlapping_authors"] == ["Alice Smith"]
+
+
+def test_find_author_conflicts_none_when_no_overlap():
+    from evidence.review import find_author_conflicts
+    assert find_author_conflicts(["Alice Smith"], [
+        {"index": 1, "authors": "Totally Different"},
+    ]) == []
+    # No authors on the paper → no conflicts.
+    assert find_author_conflicts([], [{"index": 1, "authors": "Alice Smith"}]) == []
+
+
+def test_review_report_includes_author_conflicts_field(store, cfg, fake_ollama):
+    _seed(store)
+    report = ReviewService(cfg, store=store).review("p1", external=False)
+    # Field is always present (list).
+    assert "author_conflicts" in report.as_dict()
+    # Paper authors are ["Alice Smith", "Bob Jones"]. Reference [1] is
+    # annotated as "Smith et al." → shares the "Smith" surname with Alice
+    # Smith, so the deterministic scan flags it (a legitimate same-surname
+    # self-citation signal). Reference [2] ("Lee.") does not overlap.
+    flagged = {c["ref_index"] for c in report.author_conflicts}
+    assert flagged == {1}
+    assert all(c["overlapping_authors"] == ["Alice Smith"]
+               for c in report.author_conflicts)
+
+
+def test_review_report_flags_self_citation(store, cfg, fake_ollama):
+    """When a reference's author string contains the paper's own authors,
+    the report must flag it deterministically (no model required)."""
+    from evidence.review import find_author_conflicts
+    _seed(store)
+    paper = store.get_paper("p1")
+    refs = [
+        {"index": 1, "title": "Our prior work", "authors": "Alice Smith and Bob Jones",
+         "relevance": "high", "role": "method"},
+    ]
+    conflicts = find_author_conflicts(list(paper.authors), refs)
+    assert conflicts and conflicts[0]["kind"] == "self-citation"
+
+
+def test_acronym_scan_suppresses_watermark_noise():
+    from evidence.review import find_undefined_acronyms
+    # "FOR REVIEW ONLY" banner + a paper-type acronym should NOT surface.
+    text = "FOR REVIEW ONLY. SADM submission. Uses the FMH module."
+    terms = {t["term"] for t in find_undefined_acronyms(text)}
+    assert "FMH" in terms          # genuine undefined term still flagged
+    assert "SADM" not in terms     # noise suppressed
+    assert "ONLY" not in terms     # noise suppressed
+    assert "REVIEW" not in terms   # noise suppressed

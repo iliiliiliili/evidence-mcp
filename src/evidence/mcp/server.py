@@ -244,10 +244,19 @@ def create_server(name: str = "evidence"):
              misused methods, each with a `confidence` (high|medium|low) and a
              `chunk_id`. These are things to CHECK, not confirmed errors.
           4. `undefined_terms` — terms/acronyms used without a definition.
-          5. `references` — the paper's reference list, each with a `relevance`
-             (high|medium|low) and a `role` (method|comparison|dataset|…), plus
-             a `resolved` block when `external` is enabled (was the work found
-             in OpenAlex/S2/Crossref?).
+          5. `references` — the paper's COMPLETE reference list (parsed from
+             the document, so nothing is dropped), each with a `relevance`
+             (high|medium|low) and a `role` (method|comparison|dataset|…).
+             When `external` is enabled, a `resolved` block reports the match.
+             `resolved.found` is set only on a title-verified match; an
+             unconfirmed top hit is an unverified `resolved.candidate` hint
+             (with `resolved.match_confidence`), not a false "found".
+          6. `author_conflicts` — a deterministic (no-model) list flagging any
+             reference whose author string overlaps the paper's OWN authors.
+             Each entry has `ref_index`, `ref_title`, `overlapping_authors`,
+             and `kind` (`self-citation` when all authors match,
+             `author-overlap` when only some do). Use this to surface the
+             "same-group citing its own prior work" issue automatically.
 
         `paper_id` may be an exact id or a title substring. `external` overrides
         the config's external-search setting for reference lookups (None = follow

@@ -18,6 +18,25 @@ ollama:
   reranker_local: BAAI/bge-reranker-v2-m3   # optional cross-encoder reranker
   request_timeout: 180
 
+  # ── Multiple hosts (name → URL) ────────────────────────────────────────
+  # When one or more are defined, these take precedence over the single `host`
+  # above. Add hosts with `evidence hosts-add <name> <url>`.
+  # hosts:
+  #   gpu-a: http://10.0.0.5:6006      # Ollama (default type)
+  #   llama: http://10.0.0.9:8080      # llama-server / vLLM / LM Studio / …
+  # active_host: gpu-a                 # the default host for ALL roles
+
+  # Provider per host: "ollama" (default) or "openai" (any OpenAI-compatible
+  # server speaking /v1/chat/completions + /v1/embeddings).
+  # host_types:
+  #   llama: openai
+  # Optional API key per host (or set EVIDENCE_APIKEY_<NAME>).
+  # api_keys:
+  #   llama: sk-...
+  # Route a role to a specific host; un-routed roles use `active_host`.
+  # host_by_role:
+  #   embed: llama                   # embeddings on a dedicated box
+
 # ── Hybrid retrieval ─────────────────────────────────────────────────────
 retrieval:
   candidates: 50             # FAISS + BM25 candidates before RRF fusion

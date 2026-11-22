@@ -26,6 +26,7 @@ Design follows the rest of Evidence:
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -55,6 +56,11 @@ class ReviewReport:
     incorrect_statements: list[dict] = field(default_factory=list)
     undefined_terms: list[dict] = field(default_factory=list)
     references: list[dict] = field(default_factory=list)
+    # Author overlaps / conflict-of-interest flags, deterministically
+    # derived from the paper's author list and its reference list (no model
+    # needed). Each entry: {ref_index, ref_title, ref_authors,
+    # overlapping_authors, kind: "self-citation"|"author-overlap", note}.
+    author_conflicts: list[dict] = field(default_factory=list)
 
     model: str = ""
     notes: list[str] = field(default_factory=list)
@@ -73,6 +79,7 @@ class ReviewReport:
             "incorrect_statements": self.incorrect_statements,
             "undefined_terms": self.undefined_terms,
             "references": self.references,
+            "author_conflicts": self.author_conflicts,
             "model": self.model,
             "notes": self.notes,
         }
@@ -163,6 +170,27 @@ class ReviewReport:
         else:
             lines += ["_No references could be identified._"]
 
+        # 7. author overlap / conflict-of-interest
+        lines += ["", "## 7. Author overlap / conflict of interest", ""]
+        if self.author_conflicts:
+            lines += [
+                "| Ref | Overlapping author(s) | Type |",
+                "|---|---|---|",
+            ]
+            for c in self.author_conflicts:
+                ref = c.get("ref_index") or c.get("ref_title") or "—"
+                ov = ", ".join(c.get("overlapping_authors") or []) or "—"
+                kind = c.get("kind", "")
+                lines.append(f"| {_md(ref)} | {_md(ov)} | {_md(kind)} |")
+            lines += [
+                "",
+                "_(Same-group / self-citation flags derived from the paper's "
+                "own author list vs. its references — check each against the "
+                "paper.)_",
+            ]
+        else:
+            lines += ["_No same-author overlaps detected._"]
+
         if self.notes:
             lines += ["", "---", ""]
             lines += [f"_{n}_" for n in self.notes]
@@ -191,6 +219,10 @@ def _resolve_label(resolved: dict | None) -> str:
         if resolved.get("source"):
             bits.append(resolved["source"])
         return "found" + (f" ({', '.join(bits)})" if bits else "")
+    # found == False: either nothing was found, or a low-confidence hint.
+    cand = resolved.get("candidate")
+    if cand and cand.get("title"):
+        return f"hint: {cand['title'][:60]} (unverified)"
     return "not found"
 
 
@@ -385,6 +417,159 @@ def _clean_entry(parts: list[str]) -> str:
     return re.sub(r"\s+", " ", joined).strip()
 
 
+# ── reference entry parsing + identity matching ─────────────────────────────
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s,;)\]\"'’]+")
+_ARXIV_RE = re.compile(r"(?:arxiv[:\s]*)?(\d{4}\.\d{4,5})(?:v\d+)?", re.I)
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+# A candidate external match is only reported as a confident identity match
+# when its title is at least this similar to the paper's reference entry.
+_IDENTITY_THRESHOLD = 0.5
+_STOP_TOKENS = {
+    "the", "and", "for", "with", "via", "from", "toward", "towards", "using",
+    "use", "a", "an", "of", "in", "on", "by", "to", "u", "s", "et", "al",
+}
+
+
+def _reference_from_entry(entry: str, index: int) -> dict:
+    """Parse ONE raw reference entry into a normalized dict (deterministic).
+
+    The index, DOI, arXiv id, and a 4-digit year are extracted from the text;
+    ``title``/``relevance``/``role`` are filled later (model annotation or
+    fallback to the raw text). ``raw`` always holds the full cleaned entry so
+    nothing is ever lost.
+    """
+    idx = index
+    m = _REF_MARKER_RE.match(entry)
+    if m:
+        digits = re.sub(r"\D", "", (m.group(1) or m.group(2) or ""))
+        if digits:
+            try:
+                idx = int(digits)
+            except ValueError:
+                pass
+    raw = re.sub(r"\s+", " ", entry).strip()
+    doi = _DOI_RE.search(raw)
+    year = _YEAR_RE.search(raw)
+    return {
+        "index": idx,
+        "title": "",            # filled by annotation, else the raw entry
+        "authors": "",
+        "year": int(year.group(0)) if year else None,
+        "doi": doi.group(0).rstrip(".,;") if doi else None,
+        "relevance": "medium",
+        "role": "other",
+        "notes": "",
+        "raw": raw,
+    }
+
+
+def _norm_title(s: str) -> str:
+    s = re.sub(r"[^\w\s]", " ", (s or "").lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _norm_tokens(s: str) -> set[str]:
+    return {
+        t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+        if len(t) >= 2 and t not in _STOP_TOKENS
+    }
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Similarity in [0, 1] between two titles (order-insensitive + containment).
+
+    Uses token containment (min-set denominator, so a bare matched title that is
+    a subset of a longer reference entry scores high) combined with a sequence
+    ratio, taking the better of the two.
+    """
+    ta, tb = _norm_tokens(a), _norm_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    containment = len(ta & tb) / min(len(ta), len(tb))
+    seq = difflib.SequenceMatcher(None, _norm_title(a), _norm_title(b)).ratio()
+    return max(containment, seq)
+
+
+# ── deterministic author-overlap / conflict-of-interest scan ────────────────
+# Names a reviewer would not treat as a meaningful "self-citation" overlap.
+# These are common single-token / role-y strings that appear in reference
+# entries even when they do not actually name a person on the paper.
+_AUTH_STOP_TOKENS = {
+    "and", "et", "al", "jr", "sr", "inc", "ltd", "corp", "university",
+    "institute", "lab", "labs", "group", "team", "et al",
+}
+# A name token long enough to be distinctive (avoids common short tokens and
+# single-letter initials) — used to decide an author↔reference name match.
+_DISTINCTIVE_MIN_LEN = 4
+
+
+def _authors_overlap(paper_authors: list[str], ref_authors: str) -> list[str]:
+    """Return the subset of `paper_authors` that plausibly appear in
+    `ref_authors` (a free-form "First Last, Second Last, ..." string).
+
+    An author matches if at least one of their distinctive name tokens
+    (length >= 4, excluding role/stop tokens) appears in the reference's
+    author string. This catches abbreviated forms like "A. Smith" → "Smith"
+    without falsely matching on a single common first name.
+    """
+    if not paper_authors or not (ref_authors or "").strip():
+        return []
+    ref_toks = {
+        t for t in re.findall(r"[a-z][a-z\-]+", (ref_authors or "").lower())
+    }
+    matched: list[str] = []
+    for pa in paper_authors:
+        distinctive = {
+            t for t in re.findall(r"[a-z][a-z\-]+", (pa or "").lower())
+            if len(t) >= _DISTINCTIVE_MIN_LEN and t not in _AUTH_STOP_TOKENS
+        }
+        if distinctive & ref_toks:
+            matched.append(pa.strip())
+    return matched
+
+
+def find_author_conflicts(
+    paper_authors: list[str],
+    references: list[dict],
+) -> list[dict]:
+    """Deterministic self-citation / same-group flag.
+
+    For each reference, check whether any of the paper's own authors appear in
+    the reference's author string. This surfaces the "SADM-style" issue — the
+    paper citing its own prior work or same-group work — without a model call.
+
+    Returns ``[{"ref_index", "ref_title", "ref_authors",
+    "overlapping_authors", "kind"}]``. `kind` is ``self-citation`` when all
+    paper authors match (likely the same group) and ``author-overlap`` when
+    only some do.
+    """
+    if not paper_authors:
+        return []
+    out: list[dict] = []
+    for r in references:
+        ref_authors = str(r.get("authors") or "").strip()
+        if not ref_authors:
+            continue
+        ov = _authors_overlap(paper_authors, ref_authors)
+        if not ov:
+            continue
+        kind = "self-citation" if len(ov) == len(paper_authors) else "author-overlap"
+        out.append(
+            {
+                "ref_index": r.get("index"),
+                "ref_title": r.get("title") or r.get("raw") or "",
+                "ref_authors": ref_authors,
+                "overlapping_authors": ov,
+                "kind": kind,
+                "note": (
+                    "Paper's own author(s) appear in this reference — "
+                    "likely a self-citation or same-group prior work."
+                ),
+            }
+        )
+    return out
+
+
 # ── deterministic undefined-term (acronym) scan ──────────────────────────────
 _ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{2,}\b")
 # Acronyms a reader is expected to know already (suppress false positives).
@@ -399,6 +584,14 @@ _COMMON_ACRONYMS = {
     "LLM", "NLP", "ML", "DL", "AI", "ANN", "RNN", "CNN", "LSTM", "GRU",
     "GAN", "VAE", "BERT", "GPT", "BPE", "FFT", "PCA", "SVM", "KNN",
     "MSE", "RMSE", "MAP", "MCMC",
+    # banner / watermark / all-caps-phrase noise that surfaces as "acronym"
+    # false positives (e.g. IEEE "FOR REVIEW ONLY" paper banners, "SADM"-style
+    # paper-type acronyms, copyright boilerplate)
+    "SADM", "ONLY", "CONF", "CONFIDENTIAL", "COPYRIGHT", "REGISTERED",
+    "TRAD", "MARK", "REVIEW", "VERSION", "DRAFT", "FINAL", "PREPRINT",
+    "ACCEPTED", "MANUSCRIPT", "PROOF", "GALLEY", "COPY", "REPRO", "EXCL",
+    "PAPER", "NUMBER", "AUTHOR", "PUBLICATION", "SUBMISSION", "INTERNAL",
+    "UNCLASSIFIED", "CLASSIFIED", "RESTRICTED", "LIMITED",
 }
 
 
@@ -544,113 +737,179 @@ class ReviewService:
     def _references(self, paper, ref_text: str) -> list[dict]:
         """Phase B — structure the reference list with relevance + role.
 
-        Returns a (possibly empty) normalized list. Empty when the model is
-        unavailable or there is no reference text.
+        The AUTHORITATIVE list is ``split_references(ref_text)`` (deterministic,
+        never loses entries). The model is only asked to *annotate* entries it
+        recognizes (relevance/role/notes/title/authors); unrecognized entries
+        keep the raw text and default ratings. This fixes the old bug where a
+        lossy LLM enumeration silently dropped references (e.g. 15 of 19).
         """
         if not (ref_text or "").strip():
             return []
+        entries = split_references(ref_text)
+        out: list[dict] = [
+            _reference_from_entry(e, i) for i, e in enumerate(entries, start=1)
+        ]
+        ann = self._annotate_references(paper, entries)
+        if isinstance(ann, dict):
+            self._apply_annotations(out, ann)
+        # Ensure every ref has a non-empty title for the markdown table.
+        for ref in out:
+            if not ref.get("title"):
+                ref["title"] = ref.get("raw") or ""
+        return out
+
+    def _annotate_references(self, paper, entries: list[str]) -> dict | None:
+        """Ask the model to annotate each reference entry (best-effort → None).
+
+        Returns a parsed dict with an ``annotations`` list, or None on any
+        failure. The caller applies only what it can match, by index.
+        """
+        if not entries:
+            return None
         model = self.cfg.ollama.reasoning
         system = (
-            "You are cataloguing the reference list of a research paper so a "
-            "reviewer can judge its relevance. Respond with STRICT JSON only — "
-            "no prose, no markdown fences, no trailing commas."
+            "You are a research reviewer annotating a paper's reference list. "
+            "For each numbered reference, judge its relevance and role. Respond "
+            "with STRICT JSON only — no prose, no markdown fences."
         )
+        listed = "\n".join(f"[{i}] {e}" for i, e in enumerate(entries, start=1))
         user = (
             f"Paper under review: {paper.title}\n"
             f"Abstract: {(paper.abstract or '')[:600]}\n\n"
-            "References (as they appear in the paper):\n"
-            f"{ref_text}\n\n"
-            "Return STRICT JSON with exactly this shape:\n"
+            "The following is the paper's FULL reference list (every entry is "
+            "already accounted for — do NOT add or remove any):\n"
+            f"{listed}\n\n"
+            "For each reference, return a short annotation. Return STRICT JSON "
+            "with exactly this shape:\n"
             "{\n"
-            '  "references": [\n'
+            '  "annotations": [\n'
             "    {\n"
             '      "index": 1,\n'
-            '      "title": "paper title",\n'
+            '      "title": "the work this reference is to (cleaned)",\n'
             '      "authors": "First Author et al.",\n'
-            '      "year": 2019,\n'
-            '      "doi": "10.xxxx/... (ONLY if visible in the reference text; '
-            'omit otherwise)",\n'
             '      "relevance": "high | medium | low",\n'
             '      "role": "background | method | comparison | dataset | theory '
             '| application | other",\n'
-            '      "notes": "one short sentence: what this reference is used '
-            'for in the paper"\n'
+            '      "notes": "one short sentence: what the paper uses it for"\n'
             "    }\n"
             "  ]\n"
             "}\n"
             "Rules:\n"
-            "- List every distinct reference you can identify in the text.\n"
+            "- Annotate references you can identify by index; skip any you can "
+            "not (the entry is still kept by the tool).\n"
             "- relevance: 'high' = core prior work the paper builds on or "
-            "compares against; 'medium' = useful context; 'low' = tangential "
-            "/ general background.\n"
-            "- role: pick the single best-fit label.\n"
-            "- Never invent a DOI you do not see in the text.\n"
+            "directly adopts; 'medium' = useful context; 'low' = tangential.\n"
+            "- A method/framework the paper directly ADOPTS (uses as a main "
+            "component) is 'high' with role 'method', even if it predates the "
+            "paper.\n"
+            "- role: the single best-fit label.\n"
+            "- Never invent a DOI (it is read from the text, not by you).\n"
         )
         raw = self.models.complete_json(
             user, model=model, system=system, temperature=0.1, fallback=None
         )
-        if not isinstance(raw, dict):
-            return []
-        refs = raw.get("references")
-        if not isinstance(refs, list):
-            return []
-        out: list[dict] = []
-        for i, r in enumerate(refs, start=1):
-            if not isinstance(r, dict):
+        return raw if isinstance(raw, dict) else None
+
+    def _apply_annotations(self, refs: list[dict], ann: dict) -> None:
+        """Merge the model's per-index annotations onto the authoritative list.
+
+        Primary match is by index; a positional fallback covers a model that
+        omits the index field. Title/authors/notes are applied only when the
+        model provided them; DOI/year/index stay as parsed from the raw text.
+        """
+        annotations = ann.get("annotations")
+        if not isinstance(annotations, list):
+            return
+        by_index: dict[int, dict] = {}
+        for a in annotations:
+            if not isinstance(a, dict):
                 continue
-            title = str(r.get("title") or "").strip()
-            authors = str(r.get("authors") or "").strip()
-            if not title and not authors:
-                continue
-            year = r.get("year")
             try:
-                year = int(year) if year is not None else None
+                by_index[int(a.get("index"))] = a
             except (TypeError, ValueError):
-                year = None
-            rel = str(r.get("relevance") or "").strip().lower()
-            if rel not in ("high", "medium", "low"):
-                rel = "medium"
-            role = str(r.get("role") or "").strip().lower() or "other"
-            out.append(
-                {
-                    "index": r.get("index") or i,
-                    "title": title,
-                    "authors": authors,
-                    "year": year,
-                    "doi": str(r.get("doi") or "").strip() or None,
-                    "relevance": rel,
-                    "role": role,
-                    "notes": str(r.get("notes") or "").strip(),
-                }
-            )
-        return out
+                continue
+        for i, ref in enumerate(refs):
+            a = by_index.get(ref.get("index"))
+            if a is None and i < len(annotations):
+                a = annotations[i]
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("title") or "").strip():
+                ref["title"] = str(a["title"]).strip()
+            if str(a.get("authors") or "").strip():
+                ref["authors"] = str(a["authors"]).strip()
+            rel = str(a.get("relevance") or "").strip().lower()
+            if rel in ("high", "medium", "low"):
+                ref["relevance"] = rel
+            role = str(a.get("role") or "").strip().lower()
+            if role:
+                ref["role"] = role
+            if str(a.get("notes") or "").strip():
+                ref["notes"] = str(a["notes"]).strip()
+        # Any ref the model didn't clean keeps the raw text as its title.
+        for ref in refs:
+            if not ref.get("title"):
+                ref["title"] = ref.get("raw") or ""
 
     def _resolve_reference(self, ref: dict, *, enabled: bool) -> dict:
-        """Best-effort external lookup for ONE reference (fail-soft)."""
+        """Best-effort external identity check for ONE reference (fail-soft).
+
+        Searches the external sources and only reports ``found: True`` when a
+        candidate's title is genuinely similar to the paper's reference entry
+        (``_title_similarity`` >= ``_IDENTITY_THRESHOLD``). Otherwise the top
+        candidate is returned as a *hint* (``found: False`` + ``candidate``) so
+        the review never presents a fuzzy top-cited hit as a verified identity.
+        """
         if not enabled:
             return {"found": None, "note": "external lookup disabled"}
-        query = (ref.get("title") or "").strip()
-        if ref.get("authors"):
-            query = f"{query} {ref['authors']}".strip()
-        if not query:
+        # The raw entry (title + authors + venue + year) is the best needle.
+        needle = (ref.get("raw") or ref.get("title") or "").strip()
+        if ref.get("authors") and ref["authors"] not in needle:
+            needle = f"{needle} {ref['authors']}".strip()
+        if not needle:
             return {"found": None, "note": "no title to search"}
         try:
             from .mcp.tools import search_literature
 
-            works = search_literature(query, limit=1, cfg=self.cfg)
+            works = search_literature(needle, limit=5, cfg=self.cfg)
         except Exception as exc:  # noqa: BLE001 - network is best-effort
-            logger.warning("reference lookup failed (%s): %s", query, exc)
+            logger.warning("reference lookup failed (%s): %s", needle, exc)
             return {"found": None, "note": f"lookup failed: {exc}"}
         if not works:
             return {"found": False, "note": "not found in external sources"}
-        w = works[0]
+        # Score every candidate against the reference text; keep the best.
+        best = None
+        best_score = 0.0
+        for w in works:
+            cand_title = w.get("paper") or w.get("title") or ""
+            score = _title_similarity(needle, cand_title)
+            if score > best_score:
+                best, best_score = w, score
+        if best is None or best_score < _IDENTITY_THRESHOLD:
+            top = works[0]
+            return {
+                "found": False,
+                "match_confidence": round(best_score, 2),
+                "note": (
+                    "no confident identity match — the top candidate is a "
+                    "low-confidence hint, verify manually"
+                ),
+                "candidate": {
+                    "title": top.get("paper") or top.get("title"),
+                    "year": top.get("year"),
+                    "doi": top.get("doi"),
+                    "citations": top.get("cited_by"),
+                    "source": top.get("source"),
+                },
+            }
         return {
             "found": True,
-            "match_title": w.get("paper") or w.get("title"),
-            "match_year": w.get("year"),
-            "match_doi": w.get("doi"),
-            "citations": w.get("cited_by"),
-            "source": w.get("source"),
+            "match_confidence": round(best_score, 2),
+            "match_title": best.get("paper") or best.get("title"),
+            "match_year": best.get("year"),
+            "match_doi": best.get("doi"),
+            "citations": best.get("cited_by"),
+            "source": best.get("source"),
         }
 
     # ── orchestration ────────────────────────────────────────────────────
@@ -754,6 +1013,11 @@ class ReviewService:
                 }
 
         report.references = refs
+
+        # Deterministic author-overlap / conflict-of-interest flag.
+        report.author_conflicts = find_author_conflicts(
+            list(paper.authors or []), refs
+        )
         return report
 
 

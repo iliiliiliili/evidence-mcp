@@ -89,10 +89,16 @@ def extract_json(text: str) -> Any:
 # Ollama provider
 # ─────────────────────────────────────────────────────────────────────────
 class OllamaModel:
-    """Thin wrapper around the `ollama` python client (HTTP, lazy import)."""
+    """Thin wrapper around the `ollama` python client (HTTP, lazy import).
 
-    def __init__(self, cfg: EvidenceConfig):
+    `host_name` pins a specific named host (for per-role routing). When it is
+    None (the default) the active/default host is used, preserving prior
+    behaviour for callers that do `OllamaModel(cfg)`.
+    """
+
+    def __init__(self, cfg: EvidenceConfig, host_name: str | None = None):
         self.cfg = cfg
+        self.host_name = host_name
         self._client = None
         # Models we have already confirmed present (or tried to pull) this
         # process, so we don't re-list the server on every call.
@@ -100,6 +106,13 @@ class OllamaModel:
         # Cache of the last successful `list_models` names, so `pull` can
         # re-check after a pull without another round-trip where possible.
         self._known_models: list[str] | None = None
+
+    def _host_url(self) -> str:
+        return (
+            self.cfg.ollama.host_url(self.host_name)
+            if self.host_name
+            else self.cfg.ollama.active_host_url()
+        )
 
     def _client_inner(self):
         if self._client is None:
@@ -111,7 +124,7 @@ class OllamaModel:
                     "Run `pip install ollama` or set a fallback provider."
                 ) from exc
             self._client = ollama.Client(
-                host=self.cfg.ollama.host,
+                host=self._host_url(),
                 timeout=self.cfg.ollama.request_timeout,
             )
         return self._client
@@ -284,6 +297,117 @@ class OllamaModel:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# OpenAI-compatible provider (llama-server, vLLM, LM Studio, OpenAI, …)
+# ─────────────────────────────────────────────────────────────────────────
+class OpenAIModel:
+    """Client for any OpenAI-compatible HTTP server.
+
+    Covers llama-server, vLLM, LM Studio, a hosted OpenAI endpoint, or any
+    service exposing `/v1/chat/completions` and `/v1/embeddings`. Auth is
+    optional (many local llama-server instances run with no key).
+
+    Uses `httpx` (already a core dependency). Like `OllamaModel`, `complete`
+    returns raw text and `embed` returns one vector per input; `rerank` reuses
+    the same LLM-ranking trick as the Ollama path. `ensure_model` is a no-op:
+    OpenAI-style servers do not pull models on demand.
+    """
+
+    def __init__(self, cfg: EvidenceConfig, host_name: str):
+        self.cfg = cfg
+        self.host_name = host_name
+        # Base URL: strip a trailing `/v1` if the user included it, then we add
+        # it back in the endpoint paths below.
+        self.base_url = cfg.ollama.host_url(host_name).rstrip("/")
+        self.api_key = cfg.ollama.api_key_for(host_name)
+        self.timeout = cfg.ollama.request_timeout
+
+    def _headers(self) -> dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import httpx  # core dependency
+
+        url = f"{self.base_url}/v1/{path}"
+        resp = httpx.post(url, json=payload, headers=self._headers(), timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def ensure_model(self, name: str) -> None:
+        """No-op: OpenAI-compatible servers manage their own model lifecycle."""
+        return None
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        system: str | None = None,
+        temperature: float = 0.0,
+        json: bool = False,
+    ) -> str:
+        name = model or self.cfg.ollama.light
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: dict[str, Any] = {
+            "model": name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if json:
+            payload["response_format"] = {"type": "json_object"}
+        data = self._post("chat/completions", payload)
+        return data["choices"][0]["message"]["content"]
+
+    def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+        name = model or self.cfg.ollama.embed
+        # Batch to avoid one huge request (mirrors the Ollama path).
+        batch = 32
+        out: list[list[float]] = []
+        for i in range(0, len(texts), batch):
+            chunk = texts[i : i + batch]
+            data = self._post("embeddings", {"model": name, "input": chunk})
+            # Preserve input order via the `index` field (OpenAI returns sorted).
+            rows = sorted(data["data"], key=lambda r: r.get("index", 0))
+            out.extend(r["embedding"] for r in rows)
+        return out
+
+    def rerank(self, query: str, passages: list[str]) -> list[float]:
+        """LLM-based rerank (same heuristic as the Ollama fallback)."""
+        if not passages:
+            return []
+        listing = "\n".join(f"{i+1}. {p[:400]}" for i, p in enumerate(passages))
+        prompt = (
+            "Rank the following passages by relevance to the query. "
+            "Respond ONLY with a JSON array of their numbers in best-first order.\n\n"
+            f"Query: {query}\n\nPassages:\n{listing}\n\n"
+            "Answer format: [3,1,2]"
+        )
+        try:
+            raw = self.complete(prompt, model=self.cfg.ollama.light, json=True)
+            order = extract_json(raw)
+            if not isinstance(order, list):
+                raise ValueError("expected list")
+            scores = [0.0] * len(passages)
+            for pos, idx in enumerate(order):
+                try:
+                    j = int(idx) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= j < len(passages):
+                    scores[j] = float(len(passages) - pos)
+            return scores
+        except Exception as exc:  # noqa: BLE001 - fallback must never raise
+            logger.warning("OpenAI rerank failed (%s); using neutral scores", exc)
+            return [0.5] * len(passages)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Deterministic fallbacks (no model required)
 # ─────────────────────────────────────────────────────────────────────────
 class DeterministicEmbedder:
@@ -398,15 +522,47 @@ class EmbedBackend:
 
 
 class Models:
-    """Provider-agnostic facade used by all nodes."""
+    """Provider-agnostic facade used by all nodes.
+
+    Routes each call to the right host + provider based on the model's ROLE:
+      * `reasoning` / `light` / `embed` map to models in `cfg.ollama.*`;
+      * each role resolves to a named host via `host_by_role` (else the default);
+      * each host resolves to a provider (`ollama` or `openai`) via `host_types`.
+
+    This lets e.g. embeddings live on one box and chat on another, or use
+    llama-server/vLLM (openai) for one role and Ollama for another — while a
+    single `active_host` keeps everything on one box by default.
+    """
 
     def __init__(self, cfg: EvidenceConfig):
         self.cfg = cfg
         self._ollama: OllamaModel | None = None
         self._embed: EmbedBackend | None = None
         self._rerank: CrossEncoderReranker | None = None
+        self._providers: dict[tuple[str, str | None], Any] = {}
 
-    # -- lazy accessors ----------------------------------------------------
+    # -- routing -----------------------------------------------------------
+    def _provider(self, role: str | None = None, model: str | None = None) -> Any:
+        """Resolve the provider instance for a role (or a model name).
+
+        A provider is an `OllamaModel` or `OpenAIModel` bound to the host that
+        serves this role. Instances are cached per (type, host).
+        """
+        if role is None:
+            role = self.cfg.ollama.role_for_model(model)
+        host = self.cfg.ollama.host_for_role(role)
+        ptype = self.cfg.ollama.host_type(host)
+        key = (ptype, host)
+        provider = self._providers.get(key)
+        if provider is None:
+            if ptype == "openai":
+                provider = OpenAIModel(self.cfg, host)  # host is non-None here
+            else:
+                provider = OllamaModel(self.cfg, host)
+            self._providers[key] = provider
+        return provider
+
+    # -- lazy accessors (kept for backward compatibility) ------------------
     @property
     def ollama(self) -> OllamaModel:
         if self._ollama is None:
@@ -415,19 +571,24 @@ class Models:
 
     @property
     def embedder(self) -> EmbedBackend:
-        """Uniform embed backend (Ollama preferred, hash fallback)."""
+        """Uniform embed backend for the `embed` role's host (hash fallback)."""
         if self._embed is None:
-            try:
-                import ollama  # noqa: F401
+            host = self.cfg.ollama.host_for_role("embed")
+            ptype = self.cfg.ollama.host_type(host)
+            if ptype == "openai":
+                self._embed = EmbedBackend(OpenAIModel(self.cfg, host))
+            else:
+                try:
+                    import ollama  # noqa: F401
 
-                self._embed = EmbedBackend(self.ollama)
-            except ImportError:
-                logger.warning(
-                    "Ollama not available; using deterministic hash embeddings. "
-                    "Retrieval quality will be poor — install Ollama + pull "
-                    f"{self.cfg.ollama.embed} for real embeddings."
-                )
-                self._embed = EmbedBackend(DeterministicEmbedder())
+                    self._embed = EmbedBackend(OllamaModel(self.cfg, host))
+                except ImportError:
+                    logger.warning(
+                        "Ollama not available; using deterministic hash embeddings. "
+                        "Retrieval quality will be poor — install Ollama + pull "
+                        f"{self.cfg.ollama.embed} for real embeddings."
+                    )
+                    self._embed = EmbedBackend(DeterministicEmbedder())
         return self._embed
 
     @property
@@ -453,7 +614,8 @@ class Models:
     ) -> str:
         """Complete, returning `fallback` (default "") on any provider failure."""
         try:
-            return self.ollama.complete(
+            provider = self._provider(model=model)
+            return provider.complete(
                 prompt,
                 model=model,
                 system=system,
@@ -461,7 +623,7 @@ class Models:
                 json=json,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Ollama complete failed: %s", exc)
+            logger.warning("LLM complete failed: %s", exc)
             return fallback or ""
 
     def complete_json(
@@ -475,7 +637,8 @@ class Models:
     ) -> Any:
         """Complete + parse JSON. Returns `fallback` (default None) on any failure."""
         try:
-            raw = self.ollama.complete(
+            provider = self._provider(model=model)
+            raw = provider.complete(
                 prompt, model=model, system=system, temperature=temperature, json=True
             )
             return extract_json(raw)
@@ -493,7 +656,7 @@ class Models:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Cross-encoder rerank failed (%s); using LLM fallback", exc)
             try:
-                return self.ollama.rerank(query, passages)
+                return self._provider(role="light").rerank(query, passages)
             except Exception:  # noqa: BLE001
                 return [0.5] * len(passages)
 

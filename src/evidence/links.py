@@ -15,6 +15,7 @@ re-invoking the model.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from .config import EvidenceConfig
@@ -149,10 +150,14 @@ def _llm_links_for_paper(
         "- relation: one of 'see_also' | 'depends_on' | 'cites' | 'contrasts' "
         "| 'example' | 'related'\n"
         "- confidence: number in [0, 1]\n"
-        "- reason: one short sentence (<= 12 words) explaining the link\n\n"
+        "- reason: a SHORT PHRASE, 3-8 words max (NOT a full sentence). It is a "
+        "label another model will read to decide whether to open the linked "
+        "chunk, so make it specific and navigational — e.g. 'derives objective "
+        "from', 'baseline method', 'defines KG schema', 'ablation study'. "
+        "Do NOT explain; do NOT repeat the relation word.\n\n"
         "Return STRICT JSON with exactly this shape:\n"
         '{"links": [{"src_chunk_id": "...", "dst_chunk_id": "...", '
-        '"relation": "see_also", "confidence": 0.7, "reason": "..."}]}\n'
+        '"relation": "see_also", "confidence": 0.7, "reason": "derives objective from"}]}\n'
         "An empty list is a valid answer when no non-obvious links exist."
     )
     raw = models.complete_json(
@@ -180,7 +185,9 @@ def _llm_links_for_paper(
         except (TypeError, ValueError):
             conf = 0.5
         conf = max(0.0, min(1.0, conf))
-        reason = str(ln.get("reason") or "").strip()[:160]
+        # `reason` is a short navigation phrase (3-8 words), not a sentence.
+        # Truncate defensively to ~60 chars so a chatty model can't blow it up.
+        reason = re.sub(r"\s+", " ", str(ln.get("reason") or "").strip())[:60]
         out.append(
             {
                 "src": src,

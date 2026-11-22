@@ -211,6 +211,14 @@ def search_literature(
     work (Crossref → OpenAlex) instead of a fuzzy keyword search. This is what
     makes niche citations resolvable — keyword search surfaces generic surveys
     for specific prior work, but an identifier pins the exact artifact.
+
+    **Search ≠ citation resolver:** for an open-ended *query* the top result is
+    a legitimately "most cited / most relevant" hit and is the right answer.
+    When you are instead trying to resolve one *specific* prior citation (e.g. a
+    reference-list entry with no identifier), do NOT assume the top result is
+    that work — verify the title before trusting it. `review_paper` does exactly
+    this: it scores each candidate against the reference title and reports a
+    low-confidence match as an unverified `candidate` hint rather than a hit.
     """
     cfg = cfg or EvidenceConfig.load()
 
@@ -379,10 +387,27 @@ def review_paper(
          are *candidates to check*, not verdicts).
       4. **undefined_terms** — terms/acronyms used without a definition
          (model-identified + a deterministic acronym scan).
-      5. **references** — the paper's reference list, each with a ``relevance``
-         (high/medium/low) and ``role`` (method/comparison/dataset/…). When
-         `external` is enabled each is checked against OpenAlex/S2/Crossref
-         (``resolved.found``) to confirm it is a real, findable work.
+      5. **references** — the paper's COMPLETE reference list (parsed from the
+         document, not model-enumerated, so nothing is silently dropped), each
+         with a ``relevance`` (high/medium/low) and ``role``
+         (method/comparison/dataset/…). Relevance/role are best-effort model
+         annotations layered onto the deterministic list. When `external` is
+         enabled each is checked against OpenAlex/S2/Crossref. Because a search
+         is not a citation resolver, ``resolved.found`` is set only when a
+         candidate's title matches the reference; a plausible-but-unconfirmed
+         top hit is reported as an unverified ``resolved.candidate`` hint
+         (with ``resolved.match_confidence``) rather than a false "found".
+      6. **author_conflicts** — a deterministic (no-model) list flagging any
+         reference whose author string overlaps the paper's OWN authors,
+         surfacing the "same-group citing its own prior work" issue
+         automatically. Each entry carries ``ref_index``, ``ref_title``,
+         ``overlapping_authors``, and ``kind`` (``self-citation`` when all of
+         the paper's authors appear in the reference, ``author-overlap`` when
+         only some do).
+
+    `undefined_terms` is curated: banner/watermark all-caps noise
+    (e.g. "FOR REVIEW ONLY", paper-type acronyms) is suppressed so the list
+    holds only genuinely undefined terms.
 
     `paper_id` may be an exact store id or a title substring (most-chunked match
     wins). `external` overrides `cfg.external.enabled` for reference lookups
