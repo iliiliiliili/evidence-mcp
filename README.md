@@ -1,7 +1,7 @@
 # Evidence — Local-First, Evidence-Gated Agentic RAG
 
-A reimplementation of the evidence-gated, multimodal agentic RAG architecture
-from *arXiv:2606.01613*. Evidence answers research questions over a local
+An implementation of the evidence-gated, multimodal agentic RAG architecture built on top of *arXiv:2606.01613*.
+Evidence answers research questions over a local
 corpus of technical literature (PDF / LaTeX / HTML / text) using:
 
 - **LangGraph** for agent orchestration (a deterministic, inspectable state machine),
